@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nla"
+version = "0.1.0"
+description = "Natural Language Autoencoders: train models to read and write residual-stream activations as text"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch",
+    # ==4.57.1: transformers v5's apply_chat_template API break crashes the
+    # trainers; the marker tokenization itself is stable across versions.
+    "transformers==4.57.1",
+    "safetensors",
+    "httpx",
+    "orjson",
+    "pyyaml",
+    "numpy",
+    "pyarrow",
+    "datasets",
+    "anthropic",
+    "peft",
+    "wandb",
+    "tqdm",
+    "huggingface_hub",
+]
+# Optional, installed separately:
+#   bitsandbytes : 4-bit (QLoRA) loading + 8-bit Adam — trainers fall back to
+#                  fp32 Adam without it, but --quant 4bit requires it
+#   vllm + vllm-lens : fast RL rollout backend, own venv — see
+#                  docs/vllm-lens-setup.md / scripts/install_vllm_lens.sh
+#                  (pins vllm==0.19.0)
+
+[project.urls]
+Homepage = "https://github.com/asherps/EasyNLA"
+
+[tool.setuptools.packages.find]
+include = ["nla*"]
+
+[tool.setuptools.package-data]
+nla = ["datagen/*.yaml"]
+
+[tool.ruff]
+line-length = 119
+
+[tool.mypy]
+python_version = "3.10"
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = "."
+ignore_missing_imports = true      # torch/transformers/vllm/etc. ship no/partial stubs
+follow_imports = "silent"
+check_untyped_defs = false
+disable_error_code = ["import-untyped"]
+exclude = '(^|/)(wandb|data)/'

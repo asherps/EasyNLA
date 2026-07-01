@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local runs / logs / secrets
+wandb/
+logs/
+tmp/
+.env
+.env.*
+
+# Model weights / checkpoints — never in git
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.gguf
+
+# Data (activations + gold explanations live on disk / HF, not in git)
+*.parquet
+*.nla_meta.yaml
+*.npz
+*.npy
+*.pkl
+data/
+
+# editor / OS / notebook noise
+.ipynb_checkpoints/
+.DS_Store
+.venv/
+venv/

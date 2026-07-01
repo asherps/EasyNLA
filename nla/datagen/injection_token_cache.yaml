@@ -1,0 +1,6 @@
+Qwen/Qwen3-8B:
+  char: ㈎
+  token_id: 149705
+meta-llama/Llama-3.3-70B-Instruct:
+  char: ㎡
+  token_id: 105565

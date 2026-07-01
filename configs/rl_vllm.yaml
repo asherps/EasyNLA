@@ -1,0 +1,44 @@
+# NLA RL, vLLM rollouts (nla.train_rl_vllm) — the fast path.
+# Scale with DATA PARALLELISM: launch under torchrun (--nproc_per_node=N) and each
+# rank runs its own single-GPU vLLM engine + trainer on a slice of batch_prompts,
+# with gradients all-reduced each step. CLI flags override; the merged config is
+# snapshotted to <save_dir>/run_config.yaml.
+# Defaults are the tuned values (AV lr 1e-4 / AR 8e-5 from an AV×AR grid; ~67% FVE).
+
+evals: [base_fve]        # held-out reconstruction FVE (the one built-in eval)
+train_critic: true       # co-train the AR reconstructor each step (full fine-tune)
+
+# --- optimization ---
+lr: 1.0e-4               # AV / policy LR
+critic_lr: 8.0e-5        # AR / critic LR (high AR is volatile — checkpoint-best)
+num_steps: 400
+batch_prompts: 256
+group_size: 8
+max_new_tokens: 256        # generation cap (150 truncated within steps as RL grows length)
+length_penalty: 0.01       # HINGED: penalize tokens past (max_new_tokens - 64) — smooth
+                           # pressure before the cap; cap-truncated rollouts additionally
+                           # score the -2 failure reward AND train (masking them out removed
+                           # the anti-runaway gradient -> observed policy collapse, twice)
+temperature: 1.0
+# kl_beta: unset => estimator-conditional default (k3 [DEFAULT]: 0.01, dist: 0.2)
+
+# --- LoRA (AV) ---
+lora_r: 128
+lora_alpha: 16
+use_rslora: true
+
+# --- vLLM rollout ---
+vllm_tp: 1               # per-rank tensor-parallel; keep 1 and scale with data-parallel
+                         # ranks (torchrun). Raise only for a model too big for one GPU.
+vllm_max_len: 1024
+vllm_gpu_mem: 0.35
+# IPC GPU->GPU weight sync. REQUIRES the legacy allocator: launch with
+# PYTORCH_CUDA_ALLOC_CONF unset (NOT expandable_segments:True).
+ipc_weight_sync: true
+
+# --- eval / logging ---
+eval_every: 10
+eval_n_prompts: 128
+save_every: 100
+wandb_project: nla
+wandb_name: rl_vllm
