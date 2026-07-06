@@ -83,7 +83,6 @@ def main():
                    help="load the base in 4-bit (matches the single-GPU training path)")
     args = p.parse_args()
 
-    os.environ.setdefault("HF_HOME", os.environ.get("HF_HOME", ""))
     device = "cuda"
     tok = AutoTokenizer.from_pretrained(args.base_ckpt)
     cfg = load_nla_config(args.sidecar, tok)

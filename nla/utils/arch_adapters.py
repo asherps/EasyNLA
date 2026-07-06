@@ -173,7 +173,7 @@ _LLAMA_FAMILY_MODEL_TYPES = {
     "llama", "llama4", "mistral", "mixtral",
     "qwen2", "qwen2_5", "qwen2_5_vl", "qwen3", "qwen3_moe",
     "gemma", "gemma2", "gemma3", "gemma3_text",
-    "phi", "internlm2", "olmo", "olmo2",
+    "olmo", "olmo2",
 }
 
 
@@ -193,6 +193,12 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
         return ["query_key_value", "dense"]
     if model_type == "phi3":
         return ["qkv_proj", "o_proj"]
+    if model_type == "phi":
+        # PhiAttention uses q/k/v_proj + dense (NOT o_proj) — leaving phi in
+        # the llama-family list silently skipped the output projection.
+        return ["q_proj", "k_proj", "v_proj", "dense"]
+    if model_type == "internlm2":
+        return ["wqkv", "wo"]   # fused qkv + output proj
     raise AssertionError(
         f"model_type={model_type!r}: unknown attention module naming — extend "
         f"arch_adapters.resolve_attn_target_modules for this architecture."

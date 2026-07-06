@@ -496,12 +496,15 @@ def main():
                    help="Per-forward batch (= 'micro batch'). Effective batch = "
                         "batch_size × gradient_accumulation_steps.")
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    p.add_argument("--ar-num-layers", type=int, default=25,
-                   help="K+1 for AR mode — truncate base to this many transformer blocks")
+    p.add_argument("--ar-num-layers", type=int, default=None,
+                   help="K+1 for AR mode — truncate base to this many transformer "
+                        "blocks. Default: sidecar extraction.layer_index + 1 (falls "
+                        "back to 25 = Qwen3-8B layer-24 if the sidecar lacks it); "
+                        "an explicit value is asserted against the sidecar.")
     p.add_argument("--freeze-backbone", action="store_true", default=False,
-                   help="AR mode: freeze the backbone (+ value_head), training "
-                        "nothing — used to sanity-check. This flag hard-freezes "
-                        "the AR here.")
+                   help="AR mode: freeze the backbone and train ONLY the "
+                        "value_head — a linear-probe baseline for how much of "
+                        "the reconstruction is already linearly decodable.")
     # ---- Debug sampling: periodically dump example generations to a wandb Table ----
     p.add_argument("--sample-every", type=int, default=0,
                    help="Every N steps, log example generations to an accumulating "
@@ -540,6 +543,16 @@ def main():
                         "OFF for AR (smaller model + shorter seq fits comfortably).")
     p.add_argument("--attn-implementation", default="sdpa",
                    choices=["sdpa", "flash_attention_2", "eager"])
+    p.add_argument("--full-ft-dtype", choices=["fp32", "bf16"], default="fp32",
+                   help="Parameter dtype for FULL fine-tuning (no LoRA). fp32 keeps the "
+                        "weights in fp32 and autocasts compute to bf16: in pure bf16 an "
+                        "Adam update of ~lr rounds to ZERO on any weight with |w| > lr*512 "
+                        "(round-to-nearest ULP), so at the AR default lr=2e-5 ~60%% of a "
+                        "N(0,0.02) backbone and every ~1.0-scale norm weight silently never "
+                        "move. Costs 2x weight+grad memory (checkpoints also save fp32; "
+                        "downstream loaders pass torch_dtype and cast back). Pass bf16 to "
+                        "trade correctness for memory. LoRA/4-bit paths ignore this — "
+                        "adapters start near zero, where bf16 ULP is fine.")
     p.add_argument("--quant", choices=["none", "4bit"], default="none",
                    help="4bit = bitsandbytes nf4 (QLoRA). Required for models too "
                         "big for bf16; validates the GLM-5 path on Qwen3-8B.")
@@ -581,6 +594,17 @@ def main():
         args.lr = 1e-4 if args.mode == "av" else 2e-5
     if args.gradient_checkpointing is None:
         args.gradient_checkpointing = (args.mode == "av")
+    # fp32 master weights for full fine-tuning (see --full-ft-dtype help).
+    full_ft = (not args.use_lora) and args.quant != "4bit"
+    param_dtype = torch.float32 if (full_ft and args.full_ft_dtype == "fp32") else dtype
+    amp_enabled = param_dtype is torch.float32
+
+    def amp():
+        return torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_enabled)
+
+    if amp_enabled:
+        print("[dtype] full-FT: fp32 params + bf16 autocast compute "
+              "(--full-ft-dtype bf16 to disable)")
     if args.sidecar is None:
         args.sidecar = args.parquet
 
@@ -591,6 +615,21 @@ def main():
     cfg = load_nla_config(args.sidecar, tokenizer)
     mse_scale_f = resolve_target_scale(cfg.mse_scale, cfg.d_model)
     print(f"[cfg] mode={args.mode} d_model={cfg.d_model} mse_scale={mse_scale_f}")
+    # AR depth comes from the DATA, not a magic number: activations extracted at
+    # layer K must be reconstructed by a K+1-block critic. 25 was a Qwen3-8B
+    # (layer-24) constant that silently mistrained on any other extraction layer.
+    if args.mode == "ar":
+        _side_k = cfg.extraction_layer_index
+        if args.ar_num_layers is None:
+            args.ar_num_layers = (_side_k + 1) if _side_k is not None else 25
+            print(f"[ar] --ar-num-layers defaulted to {args.ar_num_layers} "
+                  f"({'sidecar layer_index+1' if _side_k is not None else 'no sidecar layer_index; Qwen3-8B fallback'})")
+        elif _side_k is not None:
+            assert args.ar_num_layers == _side_k + 1, (
+                f"--ar-num-layers {args.ar_num_layers} != sidecar "
+                f"extraction.layer_index+1 = {_side_k + 1} — the critic would "
+                f"read a different layer than the activations were captured at."
+            )
 
     # ---- model ----
     if args.mode == "av":
@@ -604,7 +643,7 @@ def main():
             )
         dmap, max_mem = _resolve_device_map(args.device_map, args.max_gpu_mem, quant_config)
         model = AutoModelForCausalLM.from_pretrained(
-            args.base_ckpt, torch_dtype=dtype,
+            args.base_ckpt, torch_dtype=param_dtype,
             attn_implementation=args.attn_implementation,
             quantization_config=quant_config,
             device_map=dmap, max_memory=max_mem,
@@ -652,7 +691,7 @@ def main():
         if is_prepared_critic:
             print(f"[ar] loading pre-prepared critic from {args.base_ckpt}")
             model = NLACriticModel.from_pretrained(
-                args.base_ckpt, torch_dtype=dtype,
+                args.base_ckpt, torch_dtype=param_dtype,
                 attn_implementation=args.attn_implementation,
                 quantization_config=quant_config,
                 device_map=dmap, max_memory=max_mem,
@@ -671,7 +710,7 @@ def main():
             print(f"[ar] truncating base {args.base_ckpt} to {args.ar_num_layers} "
                   f"layers (quant={args.quant})")
             model = init_critic_from_base(
-                args.base_ckpt, args.ar_num_layers, dtype, quant_config,
+                args.base_ckpt, args.ar_num_layers, param_dtype, quant_config,
                 device_map=dmap, max_memory=max_mem,
                 strip_final_norm=args.strip_final_norm,
             )
@@ -706,9 +745,16 @@ def main():
                 model.backbone.gradient_checkpointing_enable()
                 print("[ar] gradient_checkpointing ENABLED (backbone)")
         if args.freeze_backbone:
+            # Linear-probe baseline: freeze the backbone, train ONLY the
+            # value_head. (The old semantics froze everything incl. the head,
+            # which then tripped the no-trainable-params assert below — the
+            # flag was unusable.)
             for p_ in model.parameters():
                 p_.requires_grad_(False)
-            print("[ar] backbone + value_head FROZEN (--freeze-backbone)")
+            for p_ in model.value_head.parameters():
+                p_.requires_grad_(True)
+            print("[ar] backbone FROZEN — training value_head only "
+                  "(linear-probe baseline, --freeze-backbone)")
     model.train()
 
     # ---- data ----
@@ -841,7 +887,9 @@ def main():
                 # the recompute skip the injection's Jacobian — a silent gradient
                 # error on the marker pathway (verified vs no-checkpoint grads).
                 vectors_ref[0] = v_batch
-                logits = model(input_ids=ids, attention_mask=attn).logits.float()
+                with amp():
+                    logits = model(input_ids=ids, attention_mask=attn).logits
+                logits = logits.float()
                 # Shift-by-one CE on response tokens. Predict ids[:, t+1] from
                 # logits[:, t]. Mask is in TARGET space (positions of tokens
                 # to predict), so mask[:, 1:] aligned with logits[:, :-1].
@@ -868,7 +916,8 @@ def main():
                 ids, attn, gold = _ar_prepare_chunk(
                     chunk_rows, tokenizer, device, max_len=args.max_len,
                 )
-                pred = critic_predict(model, ids, attn, mse_scale_f)
+                with amp():
+                    pred = critic_predict(model, ids, attn, mse_scale_f)
                 pred_n = normalize_activation(pred, mse_scale_f)
                 gold_n = normalize_activation(gold, mse_scale_f)
                 loss = F.mse_loss(pred_n, gold_n)
@@ -878,7 +927,8 @@ def main():
             try:
                 (loss / grad_accum).backward()
             finally:
-                vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
+                if vectors_ref is not None:   # AR mode has no injection hook
+                    vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
             accum_loss += loss.item()
             accum_n += 1
 
@@ -923,10 +973,11 @@ def main():
             (step + 1) % args.sample_every == 0 or (step + 1) == args.num_steps
         ):
             if args.mode == "av":
-                samps = av_generate_samples(
-                    model, tokenizer, sample_rows, cfg, device,
-                    max_new_tokens=args.sample_max_new_tokens,
-                )
+                with amp():
+                    samps = av_generate_samples(
+                        model, tokenizer, sample_rows, cfg, device,
+                        max_new_tokens=args.sample_max_new_tokens,
+                    )
                 for s in samps:
                     sample_table_data.append([step, s["idx"],
                                               s["gen_len"], s["explanation"]])
@@ -943,7 +994,7 @@ def main():
                     ids, attn, gold = _ar_prepare_chunk(
                         [row], tokenizer, device, max_len=args.max_len,
                     )
-                    with torch.no_grad():
+                    with torch.no_grad(), amp():
                         pred = critic_predict(model, ids, attn, mse_scale_f)
                     pn = normalize_activation(pred, mse_scale_f)
                     gn = normalize_activation(gold, mse_scale_f)
@@ -965,9 +1016,10 @@ def main():
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
             model.eval()
-            h_ce, h_n = heldout_av_ce(
-                model, tokenizer, heldout_av_rows, cfg, vectors_ref, device,
-                max_len=args.max_len)
+            with amp():
+                h_ce, h_n = heldout_av_ce(
+                    model, tokenizer, heldout_av_rows, cfg, vectors_ref, device,
+                    max_len=args.max_len)
             model.train()
             log["heldout_loss"] = h_ce
             log["heldout_ppl"] = math.exp(h_ce) if h_ce < 30 else float("inf")
@@ -978,10 +1030,11 @@ def main():
             (step + 1) % args.heldout_every == 0 or (step + 1) == args.num_steps
         ):
             model.eval()
-            h_mse, h_n = heldout_fve_mse(
-                model, tokenizer, heldout_pairs, cfg.critic_prompt_template,
-                mse_scale_f, device, max_len=args.max_len,
-            )
+            with amp():
+                h_mse, h_n = heldout_fve_mse(
+                    model, tokenizer, heldout_pairs, cfg.critic_prompt_template,
+                    mse_scale_f, device, max_len=args.max_len,
+                )
             model.train()
             h_fve = (1.0 - h_mse / heldout_baseline) * 100.0
             log["heldout_fve_pct"] = h_fve

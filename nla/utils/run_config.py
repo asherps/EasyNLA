@@ -60,6 +60,15 @@ def apply_config_defaults(parser):
             f"Keys must be argparse dests with UNDERSCORES (e.g. batch_prompts, not "
             f"batch-prompts). Valid keys: {sorted(valid)}"
         )
+    # Coerce YAML values through the matching argparse type= converter:
+    # PyYAML 1.1 parses `lr: 1e-4` (no dot) as the STRING "1e-4", which then
+    # bypasses argparse's type= (applied to CLI strings only, not defaults)
+    # and survives until a confusing TypeError inside the optimizer.
+    _by_dest = {a.dest: a for a in parser._actions}
+    for _k, _v in list(cfg.items()):
+        _a = _by_dest.get(_k)
+        if _a is not None and _a.type is not None and isinstance(_v, str):
+            cfg[_k] = _a.type(_v)
     parser.set_defaults(**cfg)
     # A `required=True` arg can't be satisfied by set_defaults (argparse still
     # demands it on the CLI), so clear `required` for any arg the YAML supplies.

@@ -179,29 +179,43 @@ def rollout_one_prompt(
 
 def score_with_critic(
     critic, tokenizer, explanations, activations, template, mse_scale_f, device,
+    batch_size=32,
 ):
-    """Returns list of rewards (None for failed extractions)."""
-    rewards = []
-    for expl, act in zip(explanations, activations):
+    """Returns list of rewards (None for failed extractions), reward = -recon_MSE.
+
+    BATCHED critic forward (port of the vLLM twin's): right-padded + attention
+    mask so critic_predict extracts each row's last REAL token. Identical
+    rewards to the old per-rollout batch-1 loop, but ~batch_size fewer forwards
+    (at B*G=512 the batch-1 loop was 512 forwards of the 5.4B critic)."""
+    n = len(explanations)
+    rewards = [None] * n
+    pad_id = tokenizer.eos_token_id
+    ids_list = [None] * n
+    for i, expl in enumerate(explanations):
         if expl is None:
-            rewards.append(None)
             continue
-        text = template.format(explanation=expl)
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        if len(ids) > 1024:
-            rewards.append(None)
-            continue
-        x = torch.tensor([ids], dtype=torch.long, device=device)
+        ids = tokenizer.encode(template.format(explanation=expl), add_special_tokens=False)
+        if 0 < len(ids) <= 1024:
+            ids_list[i] = ids
+    valid = [i for i in range(n) if ids_list[i] is not None]
+    for cs in range(0, len(valid), batch_size):
+        chunk = valid[cs:cs + batch_size]
+        maxlen = max(len(ids_list[i]) for i in chunk)
+        bx = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long, device=device)
+        for r, i in enumerate(chunk):
+            L = len(ids_list[i])
+            bx[r, :L] = torch.tensor(ids_list[i], dtype=torch.long, device=device)
+            attn[r, :L] = 1
         with torch.no_grad():
-            pred = critic_predict(critic, x, None, mse_scale_f)[0]  # [d]
-        gold = act.to(device).float()
-        pred_n = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
-        gold_n = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
-        mse = F.mse_loss(pred_n, gold_n).item()
-        if not math.isfinite(mse):
-            rewards.append(None)
-            continue
-        rewards.append(-mse)
+            preds = critic_predict(critic, bx, attn, mse_scale_f)            # [B, d]
+        gold = torch.stack([activations[i].to(device).float() for i in chunk], dim=0)
+        pred_n = normalize_activation(preds, mse_scale_f)
+        gold_n = normalize_activation(gold, mse_scale_f)
+        mse = ((pred_n - gold_n) ** 2).mean(dim=1)                           # [B] per-row MSE
+        for r, i in enumerate(chunk):
+            m = mse[r].item()
+            rewards[i] = (-m) if math.isfinite(m) else None
     return rewards
 
 
@@ -244,7 +258,7 @@ def grpo_update_microbatched(
     actor, optim, tokenizer, full_ids_list, prompt_lens, activations,
     advantages, vectors_ref, device,
     micro_batch=2, kl_beta=0.04, max_grad_norm=1.0,
-    kl_estimator="k3",
+    kl_estimator="k3", n_total=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -275,16 +289,15 @@ def grpo_update_microbatched(
         v_batch = torch.stack(
             [activations[i].to(device).float() for i in idxs], dim=0,
         )
-        # --- new_logp (with grad) ---
+        # --- new logits (with grad) ---
         # vectors_ref stays set from here through this chunk's .backward(): under
         # gradient checkpointing the backward-time recompute re-fires the injection
         # hook, and clearing early makes the recompute SKIP the injection's
         # Jacobian (I + v_hat h_hat^T from the norm-match) — a silent gradient
         # error on exactly the marker pathway (verified vs no-checkpoint grads).
         vectors_ref[0] = v_batch
-        new_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
-        new_logp = F.log_softmax(new_logits.float(), dim=-1)
-        # --- ref_logp: switch to the frozen "reference" adapter (= AV-SFT init).
+        new_logits = actor(input_ids=batch_ids, attention_mask=attn).logits   # [B,L,V] bf16
+        # --- ref logits: switch to the frozen "reference" adapter (= AV-SFT init).
         #     Not disable_adapter() — the policy is a LoRA, so that would anchor
         #     KL to the bare base instead of the SFT init. ---
         try:
@@ -293,8 +306,12 @@ def grpo_update_microbatched(
                 ref_logits = actor(input_ids=batch_ids, attention_mask=attn).logits
         finally:
             actor.set_adapter("default")
-        ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
-        del ref_logits
+        # SELECTIVE log-prob (ported from the vLLM twin): materialize fp32
+        # log-probs ONLY at the response positions per row, never a full
+        # [B,L,V] fp32 log_softmax (that double materialization was the memory
+        # wall that kept this trainer at --logp-micro-batch 2). Identities:
+        #   logp(tok) = logit[tok] - logsumexp(logits);  H = lse - E_p[logit].
+        # Bit-for-bit the same as F.log_softmax(...).gather(...).
         # --- per-sample GRPO loss for this chunk ---
         chunk_losses = []
         for row, i in enumerate(idxs):
@@ -304,26 +321,28 @@ def grpo_update_microbatched(
                 continue
             target_ids = batch_ids[row, p_len:L]
             pred_idx = torch.arange(p_len - 1, L - 1, device=device)
-            resp_logp = new_logp[row].index_select(0, pred_idx)   # [n_resp, V] policy log-probs
-            new_lp = resp_logp.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            resp_logits = new_logits[row].index_select(0, pred_idx).float()  # [n_resp, V]
+            lse = torch.logsumexp(resp_logits, dim=-1)
+            new_lp = resp_logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1) - lse
             with torch.no_grad():   # policy entropy over response tokens (nats), logging only
+                p_resp = (resp_logits - lse.unsqueeze(-1)).exp()
                 sample_entropy_log.append(
-                    float((-(resp_logp.exp() * resp_logp).sum(-1)).mean()))
-            ref_lp = (
-                ref_logp[row].index_select(0, pred_idx)
-                .gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-                .detach()
-            )
+                    float((lse - (p_resp * resp_logits).sum(-1)).mean()))
+                del p_resp
+            ref_resp_logits = ref_logits[row].index_select(0, pred_idx).float()
+            ref_lse = torch.logsumexp(ref_resp_logits, dim=-1)
+            ref_lp = (ref_resp_logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+                      - ref_lse).detach()
             if new_lp.numel() == 0:
                 continue
             kl_tok = None
             if kl_estimator == "dist":
                 # Full analytic KL(policy||ref) per token — bounded gradient, no
                 # exp() of a single-sample log-ratio (the k3 heavy tail behind the
-                # occasional grad/KL spikes). This path already materializes the
-                # full [n_resp, V] log-probs, so the exact sum costs nothing extra
-                # (the vLLM path uses a top-k truncation instead).
-                ref_row_logp = ref_logp[row].index_select(0, pred_idx)
+                # occasional grad/KL spikes). Computed on the response rows only;
+                # unlike the vLLM twin's top-k truncation this keeps the EXACT sum.
+                resp_logp = resp_logits - lse.unsqueeze(-1)
+                ref_row_logp = ref_resp_logits - ref_lse.unsqueeze(-1)
                 kl_tok = (resp_logp.exp() * (resp_logp - ref_row_logp)).sum(-1)
             # Pure on-policy surrogate (advantage * new_lp) + KL to ref.
             sample_loss, sample_kl = grpo_token_loss(
@@ -331,18 +350,20 @@ def grpo_update_microbatched(
             )
             chunk_losses.append(sample_loss)
             sample_kls_log.append(sample_kl.item())
-        # Free retained logp / logits before backward to bound peak.
-        del new_logits, ref_logp
+        # Free logits before backward to bound peak (new_logits retained by graph).
+        del ref_logits
         if not chunk_losses:
             vectors_ref[0] = None
-            del new_logp
+            del new_logits
             continue
         # Scale so summed chunk losses give batch-mean.
-        chunk_loss = torch.stack(chunk_losses).sum() / n
+        # Fixed-budget normalizer (see vLLM twin): dropped samples act as zeros.
+        denom = n_total if n_total is not None else n
+        chunk_loss = torch.stack(chunk_losses).sum() / denom
         chunk_loss.backward()
         vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
-        sample_losses_log.append(chunk_loss.item() * n / len(chunk_losses))
-        del new_logp
+        sample_losses_log.append(chunk_loss.item() * denom / len(chunk_losses))
+        del new_logits
     grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
     )
@@ -386,6 +407,11 @@ def main():
                    help="samples per prompt (for group baseline)")
     p.add_argument("--max-new-tokens", type=int, default=150)  # paper's rollout cap
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--eval-temperature", type=float, default=None,
+                   help="Sampling temperature for the held-out FVE eval only "
+                        "(default: --temperature). 0 = greedy/deterministic — "
+                        "matches the vLLM twin's knob so eval noise floors are "
+                        "comparable across trainers.")
     p.add_argument("--lr", type=float, default=1e-4)   # matches train_rl_vllm
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lora-r", type=int, default=128)
@@ -474,6 +500,41 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     apply_config_defaults(p)   # YAML (--config) -> argparse defaults; CLI still overrides
     args = p.parse_args()
+
+    # ---- fail-fast checks (BEFORE any model/engine loading) ----
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    # Refuse to silently overwrite an existing run: iter_* checkpoints present
+    # but no --resume-from-lora means a re-launch would clobber them.
+    _existing_iters = sorted(save_dir.glob("iter_*"))
+    if _existing_iters and args.resume_from_lora is None:
+        raise SystemExit(
+            f"[save] {save_dir} already contains {len(_existing_iters)} iter_* "
+            f"checkpoints (latest: {_existing_iters[-1].name}) — refusing to "
+            f"overwrite. Resume with --resume-from-lora {_existing_iters[-1]} "
+            f"(+ --start-step, auto-defaulted from optim_latest) or use a fresh "
+            f"--save-dir."
+        )
+    # RL checkpoints become self-describing: snapshot the resolved sidecar next
+    # to them, and on resume ASSERT the tokens/extraction contract still agrees
+    # (a wrong --sidecar silently retargets injection/extraction).
+    from nla.schema import sidecar_path_for as _spf
+    _side_src = _spf(args.sidecar)
+    _side_dst = save_dir / "nla_meta.yaml"
+    if _side_dst.exists():
+        import yaml as _yaml
+        _prev = _yaml.safe_load(_side_dst.read_text())
+        _cur = _yaml.safe_load(_side_src.read_text())
+        for _k in ("tokens", "extraction"):
+            assert _prev.get(_k) == _cur.get(_k), (
+                f"save-dir sidecar snapshot disagrees with --sidecar on {_k!r}: "
+                f"this run would score/inject differently than the checkpoints "
+                f"it resumes. Fix --sidecar or use a fresh --save-dir."
+            )
+    elif True:
+        import shutil as _sh
+        _sh.copy2(_side_src, _side_dst)
+
 
     _bad_evals = [e for e in args.evals if e not in KNOWN_EVALS]
     assert not _bad_evals, f"--evals: unknown {_bad_evals}; choices are {list(KNOWN_EVALS)}"
@@ -764,6 +825,17 @@ def main():
         _opt_ckpt = Path(args.save_dir) / "optim_latest.pt"
         if _opt_ckpt.exists():
             _opt_st = torch.load(str(_opt_ckpt), map_location="cpu", weights_only=True)
+            # Default --start-step from the saved step: forgetting the flag used
+            # to silently replay data from index 0, restart the wandb x-axis,
+            # and overwrite iter_ checkpoints.
+            _saved_step = int(_opt_st.get("step", 0))
+            if args.start_step == 0 and _saved_step > 0:
+                args.start_step = _saved_step
+                print(f"[resume] --start-step not given — defaulting to "
+                      f"optim_latest's saved step {_saved_step}.", flush=True)
+            elif args.start_step != _saved_step:
+                print(f"[resume] WARN: --start-step {args.start_step} != saved "
+                      f"step {_saved_step} — trusting the explicit flag.", flush=True)
             # Graceful on mismatch (config drift between save and resume):
             # restart the affected moments instead of killing the resume.
             try:
@@ -959,8 +1031,12 @@ def main():
         # Truncated rollouts (hit the max_new_tokens cap) are scored as FAILED
         # (-2 floor) and TRAINED ON — the failure reward is the anti-runaway
         # gradient (masking them out collapsed the policy; see the vLLM twin).
+        # Match the vLLM twin's finish_reason semantics: a sample whose EOS
+        # lands exactly on the cap's last token STOPPED (not truncated) — only
+        # cap-length rollouts that never emitted a stop id count as truncated.
         truncated = [
-            all_full_ids[i].numel() - all_prompt_lens[i] >= args.max_new_tokens
+            (all_full_ids[i].numel() - all_prompt_lens[i] >= args.max_new_tokens)
+            and (int(all_full_ids[i][-1]) not in eos_ids)
             for i in range(len(all_full_ids))
         ]
         n_truncated = int(sum(truncated))
@@ -1044,6 +1120,7 @@ def main():
             kl_beta=args.kl_beta,
             max_grad_norm=args.max_grad_norm,
             kl_estimator=args.kl_estimator,
+            n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
         )
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
@@ -1216,10 +1293,14 @@ def main():
                     vectors_ref[0] = torch.stack(_ca).to(device).float()
                     try:
                         with torch.no_grad():
+                            _et = (args.eval_temperature
+                                   if args.eval_temperature is not None
+                                   else args.temperature)
                             _gen = actor.generate(
                                 input_ids=_enc.input_ids, attention_mask=_enc.attention_mask,
                                 max_new_tokens=args.max_new_tokens,
-                                do_sample=True, temperature=1.0,
+                                do_sample=(_et > 0),
+                                **({"temperature": _et} if _et > 0 else {}),
                                 top_p=1.0, top_k=0, repetition_penalty=1.0,
                                 pad_token_id=tokenizer.eos_token_id,
                                 return_dict_in_generate=True,

@@ -247,12 +247,17 @@ def main() -> None:
 
     # Merge chunks into final output via ParquetWriter (stream, not concat —
     # 100k-scale tables don't all fit in memory at once).
-    row_count = 0
+    # Count BEFORE publishing: an all-dropped run must not leave a "complete"
+    # empty parquet+sidecar behind (resume/stage3 would treat it as done and
+    # fail far from the cause).
+    row_count = sum(pq.read_metadata(cp).num_rows for cp in chunk_paths)
+    assert row_count > 0, (
+        f"ALL rows dropped across {len(chunk_paths)} chunks — refusing to "
+        f"publish an empty dataset (check --response-extract-pattern / prompts)."
+    )
     with pq.ParquetWriter(storage.open_write(args.output), out_schema) as writer:
         for cp in chunk_paths:
-            t = pq.read_table(cp)
-            writer.write_table(t)
-            row_count += t.num_rows
+            writer.write_table(pq.read_table(cp))
 
     # Record provider config in sidecar. Pull model/max_tokens/temperature via
     # getattr — providers aren't required to have these, but the default does.

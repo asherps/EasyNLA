@@ -139,13 +139,15 @@ class AnthropicProvider(CompletionProvider):
                 raise AssertionError(f"gather returned unexpected type at [{i}]: {type(r).__name__}")
         if n_failed or n_refused:
             print(f"  [AnthropicProvider] dropped {n_refused} refused + {n_failed} retry-exhausted of {len(prompts)}")
-        if prompts and n_failed == len(prompts):
-            # Every single row retry-exhausted = systemic (network/rate-limit/key
-            # quota), not per-row content. Returning all-None would mark the chunk
-            # complete-but-empty and poison resume.
+        # >20% retry-exhausted = systemic (network/rate-limit/key quota), not
+        # per-row content. The old ALL-failed check let a 99%-hollow chunk be
+        # written as complete — and resume never revisits completed chunks.
+        # (Refusals are excluded: those are per-row content decisions.)
+        if prompts and n_failed / len(prompts) > 0.2:
             raise RuntimeError(
-                f"AnthropicProvider: ALL {len(prompts)} requests failed after "
-                f"retries — systemic failure, refusing to emit an empty chunk."
+                f"AnthropicProvider: {n_failed}/{len(prompts)} requests failed "
+                f"after retries (>20%) — systemic failure, refusing to emit a "
+                f"hollow chunk (it would be marked complete and never retried)."
             )
         return out
 

@@ -73,7 +73,9 @@ def inject_at_marked_positions(
             continue
         if input_ids[b, p - 1] != left_id or input_ids[b, p + 1] != right_id:
             continue
-        if start <= p < end:
+        if start <= p < end and vec_idx < vectors.shape[0]:
+            # vec_idx guard: surplus valid sites must reach the diagnostic
+            # count check below, not die on a bare IndexError here.
             out[b, p - start] = vectors[vec_idx]
         vec_idx += 1
     expected = vectors.shape[0]
@@ -158,6 +160,12 @@ def karvonen_inject_in_residual(
         # `out`'s storage and the in-place write below modifies the same memory
         # the autograd graph references → "modified by inplace op" RuntimeError
         # at backward time.
+        if vec_idx >= vectors.shape[0]:
+            # more valid marker sites than vectors (e.g. a response echoing the
+            # exact marker trigram): fail with the diagnostic message, not a
+            # bare IndexError from vectors[vec_idx].
+            vec_idx += 1
+            continue
         h_p = out[b, p].clone()
         v_unit = vectors[vec_idx] / (vectors[vec_idx].norm() + 1e-9)
         out[b, p] = h_p + h_p.norm() * v_unit

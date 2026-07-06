@@ -39,8 +39,11 @@ _EMBED_KEY_SUFFIXES = ("embed_tokens.weight", "wte.weight", "word_embeddings.wei
 
 @dataclass
 class NLACriticOutput:
-    values: torch.Tensor  # [B, T, d_model] — value-head output at every position
-    backbone_last_hidden: torch.Tensor  # [B, T, d_model] — pre-value-head (for norm tracking)
+    # values is None by default: nothing consumes a full-sequence value-head
+    # output, and computing it was a dead [B,T,D]@[D,D] matmul on EVERY critic
+    # call — critic_predict applies the head only at the suffix anchor.
+    backbone_last_hidden: torch.Tensor | None = None  # [B, T, d_model] — pre-value-head
+    values: torch.Tensor | None = None
 
 
 def _truncate_config_layers(config, num_layers: int) -> None:
@@ -96,16 +99,12 @@ class NLACriticModel(PreTrainedModel):
         self._no_split_modules = backbone._no_split_modules
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *, nla_num_layers: int | None = None, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load an NLACriticModel from an HF checkpoint.
 
         Normal case: checkpoint was produced by a previous NLA training run →
         config.json already has the truncated num_hidden_layers. Just load.
 
-        Bootstrapping case (fresh truncation from a full base model): pass
-        nla_num_layers = the datagen extraction layer_index. Truncation keeps
-        blocks 0..layer_index INCLUSIVE — we need the output OF block K, which
-        means we need block K to exist, so num_hidden_layers = K+1.
 
         Indexing convention (matches datagen/extractors.py):
           - datagen `layer_index=K` hooks `model.model.layers[K]` →
@@ -126,15 +125,6 @@ class NLACriticModel(PreTrainedModel):
         # visible to from_pretrained. For plain text models, text_config IS
         # config (see arch_adapters).
         text_config = resolve_text_config(config)
-        if nla_num_layers is not None:
-            needed = nla_num_layers + 1
-            assert needed <= text_config.num_hidden_layers, (
-                f"nla_num_layers={nla_num_layers} needs blocks 0..{nla_num_layers} "
-                f"inclusive (num_hidden_layers={needed}), but base model has "
-                f"only {text_config.num_hidden_layers}."
-            )
-            _truncate_config_layers(text_config, needed)
-
         backbone = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path,
             config=config,
@@ -216,12 +206,18 @@ class NLACriticModel(PreTrainedModel):
         # output back to fp32, so a fp32 head is transparent to the compute path.
         # Skip on meta (FSDP rank≠0 — broadcast handles it).
         if not model.value_head.weight.is_meta:
-            last = next(cast(nn.ModuleList, inner.layers)[-1].parameters())
+            from nla.utils.arch_adapters import resolve_decoder_layers
+            # arch-aware: GPT-2/Falcon keep layers at .transformer.h, not .layers
+            last = next(resolve_decoder_layers(backbone)[-1].parameters())
             model.value_head.to(device=last.device, dtype=torch.float32)
 
         return model
 
     def forward(self, input_ids=None, position_ids=None, attention_mask=None, **kwargs):
+        # use_cache=False: the config default (True) builds a full DynamicCache
+        # on every no-grad scoring forward — multi-GB transient at 8B scale,
+        # discarded immediately (the critic never decodes autoregressively).
+        kwargs.setdefault("use_cache", False)
         out = _inner_transformer(self.backbone)(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -231,13 +227,9 @@ class NLACriticModel(PreTrainedModel):
         # out.last_hidden_state: [B, T, d_model] — post last-kept transformer block,
         # pre-final-LN (norm was replaced with Identity in from_pretrained).
         h = out.last_hidden_state
-        # Align dtype before the value_head matmul: under 4-bit QLoRA,
-        # prepare_model_for_kbit_training casts the backbone's final norm to
-        # fp32, so h may be fp32 while value_head is bf16 (or vice-versa).
-        return NLACriticOutput(
-            values=self.value_head(h.to(self.value_head.weight.dtype)),
-            backbone_last_hidden=h,
-        )
+        # No value-head here: it was dead compute at every position (the head
+        # is applied at the single anchor in critic_predict).
+        return NLACriticOutput(backbone_last_hidden=h)
 
     def get_input_embeddings(self):
         return self.backbone.get_input_embeddings()

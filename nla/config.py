@@ -40,6 +40,12 @@ class NLAConfig:
     # (e.g. "detail." + "</" → ".</", so first suffix token is unstable).
     critic_suffix_ids: list[int] | None = None
 
+    # The transformer layer the dataset's activations were extracted at
+    # (sidecar `extraction.layer_index`). Consumers use it to default/validate
+    # depth choices — e.g. AR-SFT's --ar-num-layers should be layer_index+1;
+    # a mismatch silently trains a wrong-depth critic.
+    extraction_layer_index: int | None = None
+
     # Normalization controls. Both are resolved from sidecar's raw values
     # (None | "sqrt_d_model" | float) into concrete float | None at load time.
     #
@@ -115,6 +121,7 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
         actor_prompt_template=templates.get("av") or templates["actor"],
         critic_prompt_template=templates.get("ar") or templates.get("critic"),
         critic_num_layers=critic_k,
+        extraction_layer_index=extraction.get("layer_index"),
         critic_suffix_ids=t.get("critic_suffix_ids"),
         injection_scale=injection_scale,
         mse_scale=mse_scale,

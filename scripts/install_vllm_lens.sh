@@ -2,7 +2,7 @@
 # Build the vllm-lens venv (fast vLLM RL rollout backend for train_rl_vllm.py).
 # Rationale, version-pin reasoning, and the failure modes these pins avoid are in
 #   docs/vllm-lens-setup.md
-# After install, (re-)apply the injection patch:  python utils/patch_vllm_lens.py
+# The injection patch is applied automatically at the end (re-run after rebuilds).
 #
 # DO NOT bump vllm/torch-backend blindly — see the doc first.
 set -euo pipefail
@@ -29,3 +29,12 @@ from vllm_lens import SteeringVector
 print(f"OK — torch {torch.__version__} (cuda {torch.version.cuda}) | "
       f"vllm {vllm.__version__} | vllm_lens {vllm_lens.__version__}")
 PY
+
+echo "=== apply the vllm-lens injection patch (REQUIRED — unpatched = weak injection) ==="
+REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
+"$VENV/bin/python" "$REPO_DIR/utils/patch_vllm_lens.py" || {
+  echo "FATAL: patch_vllm_lens failed — venv would run UNPATCHED (partial-residual"
+  echo "norm-match bug: injection far too weak -> high clip-frac -> divergence)."
+  exit 1
+}
+echo "patched. NOTE: re-run this script (or the patcher) after ANY venv rebuild."

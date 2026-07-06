@@ -6,9 +6,10 @@ optimizer step the LoRA-merged actor weights get pushed into vLLM in-place,
 keeping the rollout policy exactly on-policy.
 
 The pattern is exactly how TRL's GRPOTrainer colocate mode does it:
-  1. actor.merge_adapter()              # LoRA → base, in-place
-  2. llm.collective_rpc("load_weights", args=(list(state_dict.items()),))
-  3. actor.unmerge_adapter()            # restore LoRA for training
+  1. build merged tensors OUT-OF-PLACE (base.weight + get_delta_weight) —
+     never merge_adapter()/unmerge_adapter() in place: per-step bf16
+     round-trips drift the frozen base (see sync_actor_to_vllm)
+  2. llm.collective_rpc("load_weights", args=(list(merged.items()),))
 
 This trainer is PURELY ON-POLICY: there is no importance ratio. The rollouts
 come from vLLM holding the current policy (weights re-synced after every
@@ -327,12 +328,26 @@ def _vllm_load_weights_ipc(model, handle_chunk):
     _torch.cuda.synchronize()
 
 
-def sync_actor_to_vllm(actor, llm, ipc=False):
-    """TRL-style colocate weight sync: merge LoRA, push state_dict to vLLM, unmerge.
+def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
+    """Colocate weight sync: push the LoRA-merged state to vLLM, OUT-OF-PLACE.
 
-    Matches `trl/generation/vllm_generation.py:sync_weights` for the PEFT path:
-      gather_if_zero3("model.merge_adapter()") → push name/param pairs →
-      reset_prefix_cache → unmerge.
+    Unlike TRL's merge_adapter() -> push -> unmerge_adapter() pattern, this never
+    mutates the actor: with sync running after EVERY step, 400 in-place bf16
+    merge/unmerge round-trips accumulate rounding drift into the FROZEN base
+    weights ((W+d)-d != W in bf16; measured ~0.01-0.1% relative by step 400
+    depending on the LoRA delta scale) — silently corrupting both the policy
+    base and the KL reference (merged-base mode = disable_adapter = that base).
+    Instead, merged tensors are built out-of-place per adapted module
+    (base.weight + get_delta_weight(), fp32-accumulated, rounded once —
+    verified bit-exact vs merge_adapter), and a crash mid-sync can no longer
+    leave the actor merged.
+
+    only_adapted=True (default) pushes ONLY the LoRA-adapted weights: the
+    other ~13GB of an 8B model are frozen (LoRA-only training) and identical
+    to what vLLM loaded from --av-ckpt, so re-pushing them every step bought
+    nothing. Measured 1.5-3x faster than the old full merge-push (H200,
+    node-dependent), ~200MiB transient GPU. Auto-falls back to a full push
+    if modules_to_save is present (those train outside the deltas).
 
     ipc=True: GPU->GPU sync via CUDA-IPC handles instead of the default CPU path.
     Ships ~tiny reduce_tensor() handles over apply_model (weights stay on GPU0;
@@ -344,37 +359,76 @@ def sync_actor_to_vllm(actor, llm, ipc=False):
     Returns wall-time in seconds.
     """
     t0 = time.time()
-    actor.merge_adapter()
-    try:
+    from peft.tuners.lora import LoraLayer
+
+    def _clean(k):
+        if k.startswith("base_model.model."):
+            k = k[len("base_model.model."):]
+        return k.replace(".base_layer.weight", ".weight").replace(".base_layer.bias", ".bias")
+
+    # Out-of-place merged deltas for every LoRA-adapted module, keyed by the
+    # cleaned state_dict name of its base weight.
+    # Map cleaned key -> module; deltas are computed LAZILY per weight in the
+    # push loop (building all ~144 delta tensors upfront held ~3GB on GPU).
+    lora_mods = {}
+    for mn, m in actor.named_modules():
+        if isinstance(m, LoraLayer) and any(
+            a in m.lora_A.keys()
+            for a in (m.active_adapters if hasattr(m, "active_adapters") else ["default"])
+        ):
+            lora_mods[_clean(mn + ".base_layer.weight")] = m
+
+    def _delta(m):
+        # no_grad: get_delta_weight touches lora_A/B (grad params) and would
+        # otherwise attach a live autograd graph to every pushed tensor.
+        with torch.no_grad():
+            d = None
+            for a in (m.active_adapters if hasattr(m, "active_adapters") else ["default"]):
+                if a in m.lora_A.keys():
+                    da = m.get_delta_weight(a)
+                    d = da if d is None else d + da
+            return d
+    if True:
         # PEFT prepends "base_model.model." to every param name when wrapping;
         # strip that so the names match vLLM's HF-style state_dict.
-        # Also drop the LoRA-A/B tensors themselves (they're tiny + already merged).
+        # Also drop the LoRA-A/B tensors themselves (they're tiny + merged below).
         # Bucket params by layer — vLLM v1's msgspec serialiser caps a single
         # encode at 2**32 bytes (~4 GB) and an 8B-param bf16 state_dict is
         # ~16 GB. Push layer-by-layer matches prime-rl's NCCL broadcast
         # pattern: "Yield non-layer weights first, then each layer's weights."
         from collections import defaultdict
+        sd = actor.state_dict()
+        if only_adapted and any("modules_to_save" in k for k in sd):
+            print("[sync] modules_to_save present — falling back to full push", flush=True)
+            only_adapted = False
         buckets = defaultdict(list)
-        for k, v in actor.state_dict().items():
+        for k, v in sd.items():
             if "lora_" in k or "modules_to_save" in k:
                 continue
-            new_k = k
-            if new_k.startswith("base_model.model."):
-                new_k = new_k[len("base_model.model."):]
-            # PEFT wraps every adapted Linear with `.base_layer.weight`/bias;
-            # merge_adapter() folds LoRA into the base but keeps that nesting
-            # in the state_dict (only merge_and_unload destroys it). vLLM's
-            # qwen3 loader expects flat `model.layers.X.self_attn.qkv_proj.weight`.
-            new_k = new_k.replace(".base_layer.weight", ".weight")
-            new_k = new_k.replace(".base_layer.bias", ".bias")
+            new_k = _clean(k)
+            if only_adapted and new_k not in lora_mods:
+                continue   # frozen + already in vLLM from --av-ckpt: skip
             # ipc: keep on GPU (we ship a CUDA-IPC handle, not the data).
             # else: CPU detach (the apply_model pickle path serialises the data).
-            t = v.detach() if ipc else v.detach().cpu()
-            # Layer params look like "model.layers.<N>.<...>". Non-layer params
-            # (embed, norm, lm_head) go to "_other".
-            if new_k.startswith("model.layers."):
-                layer_id = new_k.split(".", 3)[2]
-                buckets[f"layer_{int(layer_id):03d}"].append((new_k, t))
+            if new_k in lora_mods:
+                # merged copy, fp32-accumulated then rounded once — bit-exact vs
+                # merge_adapter (peft adds the fp32 delta un-rounded on CPU;
+                # pre-rounding the delta to bf16 double-rounds). Actor untouched.
+                d = _delta(lora_mods[new_k])
+                t = (v.detach().float() + d.float()).to(v.dtype).detach()
+                del d
+                if not ipc:
+                    t = t.cpu()
+            else:
+                t = v.detach() if ipc else v.detach().cpu()
+            # Layer params look like "model.layers.<N>.<...>" (Llama family) or
+            # "transformer.h.<N>.<...>" (GPT-2/Falcon). Non-layer params (embed,
+            # norm, lm_head) go to "_other". Arch-aware: with a hardcoded prefix
+            # a GPT-arch model dumps ~16GB into one "_other" chunk and blows
+            # msgspec's 4GB single-encode cap on the CPU-pickle path.
+            _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
+            if _m_layer:
+                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((new_k, t))
             else:
                 buckets["_other"].append((new_k, t))
         # Push _other first (small), then each layer in order.
@@ -399,8 +453,6 @@ def sync_actor_to_vllm(actor, llm, ipc=False):
         except AttributeError:
             # Older vLLM versions: reset via apply_model
             pass
-    finally:
-        actor.unmerge_adapter()
     return time.time() - t0
 
 
@@ -539,9 +591,13 @@ def grpo_token_loss(new_lp, ref_lp, advantage, *, kl_beta=0.01, kl_tok=None):
         # k3 estimator (unbiased, >=0) with a DELTA CLAMP: temp-1 sampling
         # occasionally draws a token the policy has suppressed to ~e^-16 while
         # the ref still likes it, and exp(delta) blows up (observed grad-norm
-        # spikes 30-145x median). Clamping delta (the input) bounds the KL-term
-        # gradient while keeping a correctly-signed
-        # pull toward the ref (clamping the OUTPUT would zero the gradient).
+        # spikes 30-145x median). The delta clamp bounds the per-token KL grad
+        # weight at exp(12)-1 (~1.6e5, x beta 0.01) — spike tokens saturate and
+        # contribute ZERO gradient beyond the clamp (an output clamp at e^12-13
+        # would behave identically; the two are a monotone reparameterization).
+        # Tokens BELOW the clamp keep the full exp gradient — that anchored pull
+        # is the emergency brake a tighter clamp (5) neutered, which entropy-
+        # collapsed two runs.
         delta = (ref_lp - new_lp).clamp(max=12.0)
         kl = torch.exp(delta) - delta - 1.0
     per_tok = -(surrogate - kl_beta * kl)
@@ -623,7 +679,7 @@ def grpo_update_microbatched(
     advantages, vectors_ref, device,
     micro_batch=2, kl_beta=0.04, max_grad_norm=1.0,
     zero_grad_first=True, do_step=True, loss_scale=1.0,
-    dp_world_size=1, kl_estimator="k3", kl_topk=64,
+    dp_world_size=1, kl_estimator="k3", kl_topk=64, n_total=None,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -719,10 +775,15 @@ def grpo_update_microbatched(
             continue
         # Scale so summed chunk losses give batch-mean; loss_scale=1/accum for
         # gradient accumulation. Logged loss divides loss_scale back out.
-        chunk_loss = torch.stack(chunk_losses).sum() / n * loss_scale
+        # Normalize by the FIXED intended budget (n_total = rollouts generated,
+        # pre-filter) when given: dropped/failed samples then act as zeros instead
+        # of inflating the survivors' per-sample weight (which under DP also
+        # weights failure-heavy ranks' samples more).
+        denom = n_total if n_total is not None else n
+        chunk_loss = torch.stack(chunk_losses).sum() / denom * loss_scale
         chunk_loss.backward()
         vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
-        sample_losses_log.append(chunk_loss.item() * n / len(chunk_losses) / loss_scale)
+        sample_losses_log.append(chunk_loss.item() * denom / len(chunk_losses) / loss_scale)
         del new_logits
     if do_step:
         _trainable = [p for p in actor.parameters() if p.requires_grad]
@@ -736,6 +797,11 @@ def grpo_update_microbatched(
         # Stepping Adam on non-finite grads corrupts moments AND weights.
         if math.isfinite(gn):
             optim.step()
+            # Applied grads must NOT survive the step: window-start zeroing is
+            # conditional (a global skip on an accum-start step bypasses it),
+            # and stale post-step grads would then be double-applied by the
+            # next window's accumulation.
+            optim.zero_grad(set_to_none=True)
         else:
             optim.zero_grad(set_to_none=True)
             print(f"[grpo] non-finite grad norm ({gn}) — skipping optimizer step",
@@ -961,6 +1027,41 @@ def main():
     apply_config_defaults(p)   # YAML (--config) -> argparse defaults; CLI still overrides
     args = p.parse_args()
 
+    # ---- fail-fast checks (BEFORE any model/engine loading) ----
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    # Refuse to silently overwrite an existing run: iter_* checkpoints present
+    # but no --resume-from-lora means a re-launch would clobber them.
+    _existing_iters = sorted(save_dir.glob("iter_*"))
+    if _existing_iters and args.resume_from_lora is None:
+        raise SystemExit(
+            f"[save] {save_dir} already contains {len(_existing_iters)} iter_* "
+            f"checkpoints (latest: {_existing_iters[-1].name}) — refusing to "
+            f"overwrite. Resume with --resume-from-lora {_existing_iters[-1]} "
+            f"(+ --start-step, auto-defaulted from optim_latest) or use a fresh "
+            f"--save-dir."
+        )
+    # RL checkpoints become self-describing: snapshot the resolved sidecar next
+    # to them, and on resume ASSERT the tokens/extraction contract still agrees
+    # (a wrong --sidecar silently retargets injection/extraction).
+    from nla.schema import sidecar_path_for as _spf
+    _side_src = _spf(args.sidecar)
+    _side_dst = save_dir / "nla_meta.yaml"
+    if _side_dst.exists():
+        import yaml as _yaml
+        _prev = _yaml.safe_load(_side_dst.read_text())
+        _cur = _yaml.safe_load(_side_src.read_text())
+        for _k in ("tokens", "extraction"):
+            assert _prev.get(_k) == _cur.get(_k), (
+                f"save-dir sidecar snapshot disagrees with --sidecar on {_k!r}: "
+                f"this run would score/inject differently than the checkpoints "
+                f"it resumes. Fix --sidecar or use a fresh --save-dir."
+            )
+    elif int(os.environ.get("RANK", "0")) == 0:
+        import shutil as _sh
+        _sh.copy2(_side_src, _side_dst)
+
+
     _bad_evals = [e for e in args.evals if e not in KNOWN_EVALS]
     assert not _bad_evals, f"--evals: unknown {_bad_evals}; choices are {list(KNOWN_EVALS)}"
 
@@ -1087,6 +1188,13 @@ def main():
         print(f"[actor] continued; sum(default lora_param²) = {_lora_norm:.2e} (must be >0)")
     else:
         print(f"[actor] loading {args.av_ckpt}")
+        print(
+            "[actor] NOTE: no --av-adapter — RL starts from a FRESH zero-init "
+            "LoRA on the merged AV (B=0 => a random rank-r subspace; measured "
+            "~12pp FVE cold-start). To continue tuning the SFT adapter itself, "
+            "pass --base-ckpt <raw base> --av-adapter <sft adapter dir>.",
+            flush=True,
+        )
         actor = AutoModelForCausalLM.from_pretrained(
             args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         ).to(device)
@@ -1327,6 +1435,17 @@ def main():
         _opt_ckpt = Path(args.save_dir) / "optim_latest.pt"
         if _opt_ckpt.exists():
             _opt_st = torch.load(str(_opt_ckpt), map_location="cpu", weights_only=True)
+            # Default --start-step from the saved step: forgetting the flag used
+            # to silently replay data from index 0, restart the wandb x-axis,
+            # and overwrite iter_ checkpoints.
+            _saved_step = int(_opt_st.get("step", 0))
+            if args.start_step == 0 and _saved_step > 0:
+                args.start_step = _saved_step
+                print(f"[resume] --start-step not given — defaulting to "
+                      f"optim_latest's saved step {_saved_step}.", flush=True)
+            elif args.start_step != _saved_step:
+                print(f"[resume] WARN: --start-step {args.start_step} != saved "
+                      f"step {_saved_step} — trusting the explicit flag.", flush=True)
             # Graceful on mismatch (config drift between save and resume — e.g.
             # toggling --ar-lora or changing its rank changes the param groups):
             # restart the affected moments instead of killing the resume.
@@ -1534,6 +1653,15 @@ def main():
             steer_apply_count / n_rollouts_gen
             if steer_apply_count >= 0 and n_rollouts_gen else float("nan")
         )
+        if steer_apply_count < 0 and not globals().get("_steer_counter_warned"):
+            globals()["_steer_counter_warned"] = True
+            print(
+                "WARNING: vllm-lens steer counter unavailable (-1) — "
+                "utils/patch_vllm_lens.py not applied to this venv? The <98% "
+                "injection warning is DISABLED; only the cjk/marker checks "
+                "remain. Re-run scripts/install_vllm_lens.sh or the patcher.",
+                flush=True,
+            )
         # NOTE the apply-count is APPROXIMATE, not a per-request invariant: it counts
         # write EVENTS, and normal vLLM scheduling can re-run a request's marker
         # chunk (re-prefill => +1) or shift coverage windows (a constant few per 512
@@ -1704,6 +1832,7 @@ def main():
             zero_grad_first=is_accum_start, do_step=is_accum_end,
             loss_scale=1.0 / accum, dp_world_size=world_size,
             kl_estimator=args.kl_estimator, kl_topk=args.kl_topk,
+            n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
         )
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         # Build a scalar-tensor stand-in for the existing logging path that
@@ -1726,12 +1855,16 @@ def main():
             # identical across ranks.
             continue
 
-        # ---- Push HF actor weights → vLLM after EVERY step (TRL colocate pattern).
-        # Unconditional by design: the on-policy surrogate (advantage * new_logp,
-        # no importance ratio) is only correct if the sampler holds the current
-        # policy — a lazier sync would silently bias the gradient. ----
-        vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
-        print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
+        # ---- Push HF actor weights → vLLM after every WEIGHT CHANGE (accum-end).
+        # The on-policy surrogate (advantage * new_logp, no importance ratio) is
+        # only correct if the sampler holds the current policy, so sync is not
+        # configurable — but on non-accum-end steps optim.step() didn't run and
+        # the weights are byte-identical, so syncing would push ~16GB for
+        # nothing (at grad_accum=4 that's 3 wasted syncs per real update). ----
+        vllm_sync_secs = 0.0
+        if is_accum_end:
+            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+            print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
 
         # ---- AR critic co-training (paper-faithful, optional) ----
         # Per paper §RL: "Update the AR by one step of gradient descent on the
@@ -1802,6 +1935,7 @@ def main():
                             critic_trainable, args.max_grad_norm,
                         )
                         critic_optim.step()
+                        critic_optim.zero_grad(set_to_none=True)  # never leave applied grads (see actor step)
                         critic_grad_norm_val = (
                             critic_grad_norm.item()
                             if hasattr(critic_grad_norm, "item")
@@ -1825,6 +1959,7 @@ def main():
                     else float(critic_grad_norm))
             if math.isfinite(_cgn):
                 critic_optim.step()
+                critic_optim.zero_grad(set_to_none=True)  # never leave applied grads (see actor step)
             else:
                 critic_optim.zero_grad(set_to_none=True)
             critic_grad_norm_val = _cgn

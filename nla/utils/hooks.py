@@ -35,8 +35,10 @@ def register_karvonen_hook(model, vectors_ref, inj_id, left_id, right_id, layer_
         # device_map="auto": this layer may live on a different GPU than where
         # the caller staged input_ids / the vector. Align to the residual.
         ids = input_ids.to(resid.device)
-        if (ids == inj_id).sum().item() == 0:
-            return output
+        # NO zero-marker early-return: every legit forward with vectors_ref set
+        # contains markers (decode steps are caught by the seq_len<2 guard above),
+        # so zero markers = template drift — let karvonen_inject_in_residual's
+        # count-mismatch check fail LOUD instead of silently skipping injection.
         injected = karvonen_inject_in_residual(
             ids, resid, v.to(resid.device), inj_id, left_id, right_id,
         )

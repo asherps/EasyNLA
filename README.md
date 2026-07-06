@@ -76,6 +76,12 @@ torchrun --standalone --nproc_per_node=4 -m nla.train_rl_vllm --config configs/r
     --wandb-project easynla --wandb-name rl_vllm
 ```
 
+> 💡 **Warm-start the RL LoRA from the SFT adapter** when you trained the AV with
+> LoRA: `--base-ckpt <raw base> --av-adapter <av_sft adapter dir>` continues tuning
+> the SAME adapter SFT trained (and keeps a frozen copy as the KL reference).
+> Without it, RL starts from a fresh zero-init LoRA on the merged AV — a measured
+> ~12pp FVE cold-start (B=0 puts step 0 in a random rank-r subspace).
+
 **~70% held-out FVE in ~3–4 hours on 4×H200** (Qwen3-8B, layer 24). Set
 `--nproc_per_node` to your GPU count (`batch_prompts` is the global batch, split
 across ranks). For a model too big for one GPU, raise `--vllm-tp` (tensor-parallel

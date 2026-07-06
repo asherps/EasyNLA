@@ -9,6 +9,7 @@ and FSDP DCP are local-fs-only, so checkpoint IO stays pathlib.
 
 import hashlib
 import importlib
+import os
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -163,8 +164,12 @@ def fetch_to_local_cache(
     local.ensure_parent(local_base)
 
     base = remote_path.split("@[")[0]
-    with remote.open_read(base) as src, local.open_write(local_base) as dst:
+    # tmp + atomic rename: a preempted/killed copy must not leave a truncated
+    # file that the bare exists() check above treats as a valid cache hit.
+    _tmp = local_base + ".tmp"
+    with remote.open_read(base) as src, local.open_write(_tmp) as dst:
         shutil.copyfileobj(src, dst)
+    os.replace(_tmp, local_base)
 
     remote_sc = dataset_sidecar_path(base)
     if remote.exists(remote_sc):

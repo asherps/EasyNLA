@@ -28,4 +28,8 @@ def critic_predict(critic, input_ids, attention_mask, mse_scale_f):
     bs = input_ids.shape[0]
     last_h = backbone_last[torch.arange(bs, device=input_ids.device), last_idx].float()
     last_h_norm = normalize_activation(last_h, mse_scale_f)
-    return critic.value_head(last_h_norm.to(critic.value_head.weight.dtype)).float()
+    # The value_head is deliberately fp32 (see NLACriticModel.from_pretrained);
+    # keep its matmul fp32 even when the caller runs the backbone under a bf16
+    # autocast (fp32 full-FT mode) — autocast would silently demote it.
+    with torch.autocast(device_type=last_h_norm.device.type, enabled=False):
+        return critic.value_head(last_h_norm.to(critic.value_head.weight.dtype)).float()

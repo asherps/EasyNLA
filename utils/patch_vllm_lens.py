@@ -265,7 +265,9 @@ def main() -> int:
         print(f"[patch_vllm_lens] already patched (all {len(HUNKS)} hunks): {path}")
         return 0
 
-    shutil.copy2(path, path.with_suffix(".py.orig"))
+    _orig = path.with_suffix(".py.orig")
+    if not _orig.exists():   # keep the PRISTINE original across incremental patches
+        shutil.copy2(path, _orig)
     for old, new in to_apply:
         src = src.replace(old, new, 1)
     path.write_text(src)

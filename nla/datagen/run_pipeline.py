@@ -53,8 +53,25 @@ def _storage_args(cfg: dict[str, Any]) -> list[str]:
     return args
 
 
+def _stage0_multigpu_script() -> Path:
+    """Resolve (and REQUIRE) the multi-GPU stage0 wrapper. Called at the top of
+    _stage0 so a config with multigpu: true fails immediately — not 45min into
+    a pipeline: the wrapper is not shipped in this repo (it lives in the full
+    repo); set multigpu: false or port scripts/datagen/stage0_multigpu.sh."""
+    repo = Path(__file__).resolve().parents[2]
+    sh = repo / "scripts/datagen/stage0_multigpu.sh"
+    assert sh.exists(), (
+        f"stage0.multigpu: true but {sh} does not exist — this repo ships only "
+        f"the single-process stage0; set multigpu: false or port the wrapper "
+        f"from the full repo."
+    )
+    return sh
+
+
 def _stage0(cfg: dict[str, Any], p: dict[str, str]) -> None:
     s0 = cfg["stage0"]
+    if s0.get("multigpu", False):
+        _stage0_multigpu_script()   # fail-fast before building args
     common = [
         "--base-model", cfg["base_model"],
         "--corpus", cfg["corpus"]["name"],
@@ -75,8 +92,7 @@ def _stage0(cfg: dict[str, Any], p: dict[str, str]) -> None:
         common += ["--extractor-kwargs", json.dumps(s0["extractor_kwargs"])]
 
     if s0.get("multigpu", False):
-        repo = Path(__file__).resolve().parents[2]
-        _run(["bash", str(repo / "scripts/datagen/stage0_multigpu.sh"), *common])
+        _run(["bash", str(_stage0_multigpu_script()), *common])
     else:
         _run([sys.executable, "-m", "nla.datagen.stage0_extract", *common])
 
