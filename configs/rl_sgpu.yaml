@@ -4,7 +4,7 @@
 # Defaults are shared with the vLLM path (NB: this path's critic is a 4-bit
 # LoRA-AR rather than a full fine-tune, so if you sweep, sweep here separately).
 
-evals: [base_fve]
+evals: [base_fve, text_judges]   # see rl_vllm.yaml; text_judges needs ANTHROPIC_API_KEY
 train_critic: true
 critic_lr: 8.0e-5        # matches the vLLM path (shared default)
 

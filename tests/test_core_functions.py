@@ -642,6 +642,38 @@ def t_twin_scorer_equivalence():
         assert abs(rv[i] - rs[i]) < 1e-5, (i, rv[i], rs[i])
 
 
+
+
+def t_branch_resume_optim_lookup():
+    """find_optim_ckpt must locate the OLD run's optimizer state on a
+    branch-style resume (new save-dir, LoRA from the old run's dir) — the
+    save-dir-only search silently restarted Adam cold, which spiraled
+    late-stage policies to entropy death in the full repo (2/2)."""
+    from nla.utils.resume import find_optim_ckpt
+    with tempfile.TemporaryDirectory() as td:
+        old_run = Path(td) / "old_run"; (old_run / "iter_000200").mkdir(parents=True)
+        new_run = Path(td) / "new_run"; new_run.mkdir()
+        # no optimizer state anywhere -> None
+        assert find_optim_ckpt(new_run, old_run / "iter_000200") is None
+        # old run has it -> branch resume finds it via the LoRA's parent
+        (old_run / "optim_latest.pt").write_bytes(b"x")
+        got = find_optim_ckpt(new_run, old_run / "iter_000200")
+        assert got == old_run / "optim_latest.pt", got
+        # same-dir resume: save_dir's own state wins even if both exist
+        (new_run / "optim_latest.pt").write_bytes(b"y")
+        got = find_optim_ckpt(new_run, old_run / "iter_000200")
+        assert got == new_run / "optim_latest.pt", got
+        # same-dir style (LoRA inside save_dir) degenerates correctly
+        (new_run / "iter_000100").mkdir()
+        got = find_optim_ckpt(new_run, new_run / "iter_000100")
+        assert got == new_run / "optim_latest.pt", got
+    # both trainers actually use the helper
+    for f in ("nla/train_rl_vllm.py", "nla/train_rl_self_contained.py"):
+        src = (REPO / f).read_text()
+        assert "find_optim_ckpt(args.save_dir, args.resume_from_lora)" in src, f
+        assert "warn_cold_adam(args.start_step)" in src, f
+
+
 if __name__ == "__main__":
     check("extract_explanation", t_extract_explanation)
     check("normalize_activation", t_normalize_activation)
@@ -665,6 +697,7 @@ if __name__ == "__main__":
     check("yaml_float_coercion", t_yaml_float_coercion)
     check("critic_forward_no_kv_cache", t_critic_forward_no_kv_cache)
     check("inject_at_marked_positions_surplus", t_inject_at_marked_positions_surplus)
+    check("branch_resume_optim_lookup", t_branch_resume_optim_lookup)
     check("twin_grad_equivalence", t_twin_grad_equivalence)
     check("twin_scorer_equivalence", t_twin_scorer_equivalence)
     n_fail = sum(1 for _, e in RESULTS if e)

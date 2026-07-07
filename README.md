@@ -91,6 +91,18 @@ the merged run config is snapshotted to `<save-dir>/run_config.yaml`.
 > ⚠️ The IPC weight sync needs the legacy CUDA allocator — launch with
 > `PYTORCH_CUDA_ALLOC_CONF` unset (not `expandable_segments:True`).
 
+**Optional LLM-judge eval** — add `text_judges` to `evals:` (or `--evals base_fve
+text_judges`) to score every held-out explanation on **unique_info, coherence,
+writing_quality, specificity, repetitiveness** (Opus rubric 1-10 each;
+repetitiveness is lower-better) plus
+**source_match** (pick the true source among 4 candidates; chance 25%) every
+`--text-judges-every` steps, reusing the FVE eval's generations. Needs
+`ANTHROPIC_API_KEY`; logs to `eval_judge/*`. Tracks the classic RL text-degradation
+modes (writing-quality drift, repetitive filler) that reconstruction FVE alone
+can't see — NB: only extraction-successful outputs are judged, so read the
+rubric means together with `eval/extraction_rate` (a full format collapse
+shows up there, not in these means).
+
 ## Full recipe (any decoder LM)
 
 You need three things before RL: **data** (activations + gold explanations) and an

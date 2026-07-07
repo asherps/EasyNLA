@@ -5,7 +5,11 @@
 # snapshotted to <save_dir>/run_config.yaml.
 # Defaults are the tuned values (AV lr 1e-4 / AR 8e-5 from an AV×AR grid; ~67% FVE).
 
-evals: [base_fve]        # held-out reconstruction FVE (the one built-in eval)
+evals: [base_fve, text_judges]   # held-out FVE + Opus-judged text attributes
+                         # (unique_info/coherence/writing_quality/specificity/
+                         # repetitiveness + source_match) every --text-judges-every
+                         # steps. text_judges needs ANTHROPIC_API_KEY — drop it from
+                         # this list (or pass --evals base_fve) to run without one.
 train_critic: true       # co-train the AR reconstructor each step (full fine-tune)
 
 # --- optimization ---

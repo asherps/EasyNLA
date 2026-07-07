@@ -55,7 +55,7 @@ from nla.utils import build_prompt_text, cjk_fraction, critic_predict, register_
 from nla.utils.run_config import add_config_arg, apply_config_defaults, save_resolved_config
 
 # Evals selectable via the config `evals:` list. base_fve is the core FVE.
-KNOWN_EVALS = ("base_fve",)
+KNOWN_EVALS = ("base_fve", "text_judges")
 from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual, marker_well_formed
 from nla.models import NLACriticModel
@@ -407,6 +407,13 @@ def main():
                    help="samples per prompt (for group baseline)")
     p.add_argument("--max-new-tokens", type=int, default=150)  # paper's rollout cap
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--text-judges-every", type=int, default=50,
+                   help="Run the Opus text-attribute judges every N steps, reusing that "
+                        "step's held-out eval generations (see the vLLM twin / "
+                        "nla/utils/text_judges.py). Multiple of --eval-every; needs "
+                        "ANTHROPIC_API_KEY; only active with `--evals ... text_judges`.")
+    p.add_argument("--judge-concurrency", type=int, default=64,
+                   help="Concurrent judge API calls for text_judges.")
     p.add_argument("--eval-temperature", type=float, default=None,
                    help="Sampling temperature for the held-out FVE eval only "
                         "(default: --temperature). 0 = greedy/deterministic — "
@@ -538,6 +545,14 @@ def main():
 
     _bad_evals = [e for e in args.evals if e not in KNOWN_EVALS]
     assert not _bad_evals, f"--evals: unknown {_bad_evals}; choices are {list(KNOWN_EVALS)}"
+    if "text_judges" in args.evals:
+        from nla.utils.text_judges import require_judge_key
+        require_judge_key()
+        assert args.text_judges_every > 0, "--text-judges-every must be > 0"
+        assert args.eval_every > 0 and args.text_judges_every % args.eval_every == 0, (
+            f"--text-judges-every {args.text_judges_every} must be a multiple of "
+            f"--eval-every {args.eval_every}."
+        )
 
     if args.kl_beta is None:
         # dist (full analytic KL) needs a higher beta than k3 for equal
@@ -822,8 +837,14 @@ def main():
     # Resume: restore Adam moments (saved latest-only alongside checkpoints) —
     # same layout as the vLLM twin.
     if args.resume_from_lora is not None:
-        _opt_ckpt = Path(args.save_dir) / "optim_latest.pt"
-        if _opt_ckpt.exists():
+        from nla.utils.resume import find_optim_ckpt, warn_cold_adam
+        # Search save_dir AND the resumed LoRA's parent dir: branch-style
+        # resumes (old run's LoRA, new save-dir) used to silently miss the old
+        # run's optim_latest -> cold Adam (no second-moment history) ->
+        # entropy-death spiral on late-stage policies (2/2 in the full repo).
+        _opt_ckpt = find_optim_ckpt(args.save_dir, args.resume_from_lora)
+        if _opt_ckpt is not None:
+            print(f"[resume] optimizer state: {_opt_ckpt}", flush=True)
             _opt_st = torch.load(str(_opt_ckpt), map_location="cpu", weights_only=True)
             # Default --start-step from the saved step: forgetting the flag used
             # to silently replay data from index 0, restart the wandb x-axis,
@@ -848,8 +869,7 @@ def main():
                 print(f"[resume] WARN: optimizer state incompatible ({_e}) — "
                       f"Adam moments restart.", flush=True)
         else:
-            print("[resume] WARN: no optim_latest.pt in save-dir — Adam moments "
-                  "restart from zero (expect a small transient).", flush=True)
+            warn_cold_adam(args.start_step)
 
     # Snapshot the fully-resolved run config (defaults+YAML+CLI) next to the ckpt.
     save_resolved_config(args, args.save_dir)
@@ -887,16 +907,21 @@ def main():
         for _rg_idx in range(_pf.num_row_groups):
             if len(eval_rows) >= args.eval_n_prompts:
                 break
+            _tj_cols = (["detokenized_text_truncated"]
+                        if "detokenized_text_truncated" in _pf.schema_arrow.names else [])
             _rg = _pf.read_row_group(
-                _rg_idx, columns=["prompt", "activation_vector", "doc_id"])
+                _rg_idx, columns=["prompt", "activation_vector", "doc_id"] + _tj_cols)
             _prompts = _rg.column("prompt").to_pylist()
             _acts = np.asarray(
                 _rg.column("activation_vector").combine_chunks().flatten(),
                 dtype=np.float32).reshape(len(_prompts), -1)
             _dids = _rg.column("doc_id").to_pylist()
+            _srcs = (_rg.column("detokenized_text_truncated").to_pylist()
+                     if _tj_cols else [""] * len(_prompts))
             for _i, _d in enumerate(_dids):
                 if is_val_doc(_d, val_permille):
-                    eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i]})
+                    eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i],
+                                      "source": _srcs[_i] or ""})
                     if len(eval_rows) >= args.eval_n_prompts:
                         break
         print(f"[eval] {len(eval_rows)} held-out-doc prompts loaded "
@@ -922,7 +947,9 @@ def main():
             if len(eval_rows) >= args.eval_n_prompts:
                 break
             _rg = _pf.read_row_group(
-                _rg_idx, columns=["prompt", "activation_vector", "doc_id"],
+                _rg_idx, columns=["prompt", "activation_vector", "doc_id"]
+                + (["detokenized_text_truncated"]
+                   if "detokenized_text_truncated" in _pf.schema_arrow.names else []),
             )
             _n = _rg.num_rows
             if _seen + _n <= args.eval_skip_rows:
@@ -932,10 +959,13 @@ def main():
             _prompts = _rg.column("prompt").to_pylist()
             _acts = _rg.column("activation_vector").to_pylist()
             _dids = _rg.column("doc_id").to_pylist()
+            _srcs = (_rg.column("detokenized_text_truncated").to_pylist()
+                     if "detokenized_text_truncated" in _rg.schema.names else [""] * _n)
             for _i in range(_start, _n):
                 if _dids[_i] in _train_doc_ids:
                     continue
-                eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i]})
+                eval_rows.append({"prompt": _prompts[_i], "activation": _acts[_i],
+                                  "source": _srcs[_i] or ""})
                 if len(eval_rows) >= args.eval_n_prompts:
                     break
             _seen += _n
@@ -1373,6 +1403,28 @@ def main():
                 f"| ext {log['eval/extraction_rate']:.0%}",
                 flush=True,
             )
+            # ---- Opus text-attribute judges (opt-in; reuses THIS round's
+            # generations — see nla/utils/text_judges.py) ----
+            if "text_judges" in args.evals and step % args.text_judges_every == 0:
+                from nla.utils.text_judges import RUBRIC_PROMPTS, judge_explanations
+                _t_tj = time.time()
+                _tj_expl = [r["explanation"] if r["extracted"] else None
+                            for r in eval_records]
+                _tj_src = [row.get("source", "") for row in eval_rows]
+                tj_metrics, _ = judge_explanations(
+                    _tj_expl, _tj_src, seed=args.seed,
+                    concurrency=args.judge_concurrency)
+                log.update({f"eval_judge/{k}": v for k, v in tj_metrics.items()})
+                log["time/eval_text_judges_s"] = time.time() - _t_tj
+                print(
+                    f"  [text_judges@{step}] "
+                    + " ".join(f"{d} {tj_metrics[d + '_mean']:.2f}"
+                               for d in RUBRIC_PROMPTS)
+                    + f" | match {tj_metrics['source_match_acc']:.0%}"
+                    f" | judge_fail {tj_metrics['judge_fail_rate']:.0%}"
+                    f" | {log['time/eval_text_judges_s']:.0f}s",
+                    flush=True,
+                )
             # Print 3 sample explanations so the log itself shows how outputs
             # evolve. Pick indices 0, 7, 14 — spread across the eval set.
             for _ei in (0, 7, 14):
