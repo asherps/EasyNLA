@@ -109,6 +109,14 @@ You need three things before RL: **data** (activations + gold explanations) and 
 **AV** + **AR** warm-start. The end-to-end recipe is in
 **[`docs/train_new_model.md`](docs/train_new_model.md)**:
 
+> 💾 **Skip step 1 for Qwen3-8B**: the full non-compositional warmstart data
+> (371k rows, layer-24 activations + gold explanations, doc-level train/val
+> splits, sidecars included) is on HuggingFace:
+> [`asher577/easynla-warmstart-data`](https://huggingface.co/datasets/asher577/easynla-warmstart-data).
+> `huggingface-cli download asher577/easynla-warmstart-data --repo-type dataset --local-dir <data>`
+> then point `--parquet`/`--sidecar` at `<data>/av_sft_train.parquet` (and
+> `--heldout-parquet` at the matching `_val` file).
+
 ```bash
 # 1. data — activations + gold explanations (edit the datagen config head first)
 python -m nla.datagen.run_pipeline --config configs/datagen/qwen3_8b_finefineweb_100k.yaml
