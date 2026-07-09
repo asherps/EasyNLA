@@ -1581,10 +1581,15 @@ def main():
         # A rollout failing EITHER is dropped from the AV update, the AR co-training,
         # and the GRPO group baseline below.
         cjk_fail = [cjk_fraction(t) > 0.05 for t in all_response_text]
+        # Check the FULL sequence (prompt+response), not just the prompt: the GRPO
+        # logprob forward runs on full ids, so a marker the policy ECHOES into its
+        # response (with canonical neighbors — e.g. verbatim "<concept>㊗</concept>")
+        # adds a second valid injection site and crashes the hook's vec_idx
+        # bookkeeping (IndexError: index N out of bounds — observed at step 224 of
+        # a 400-step run once KL drift set in). Echo rollouts are dropped like cjk
+        # failures and counted in n_marker_bad.
         marker_ok = [
-            marker_well_formed(
-                all_full_ids[i][: all_prompt_lens[i]].tolist(), inj_id, left_id, right_id
-            )
+            marker_well_formed(all_full_ids[i].tolist(), inj_id, left_id, right_id)
             for i in range(len(all_full_ids))
         ]
         inject_ok = [
