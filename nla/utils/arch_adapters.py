@@ -180,6 +180,10 @@ _LLAMA_FAMILY_MODEL_TYPES = {
 def resolve_attn_target_modules(config: Any) -> list[str]:
     """Attention-projection module names for LoRA, resolved by model_type.
 
+    LEGACY: kept for older checkpoints whose ar_meta.json recorded attn-only
+    targets. New training uses resolve_lora_target_modules (attention + dense
+    MLP), which converges meaningfully better at the same rank.
+
     Unwraps multimodal configs first (Gemma-3 nests model_type under
     text_config). Raises loudly for unknown archs instead of letting PEFT
     silently adapt nothing / crash mid-init.
@@ -196,4 +200,33 @@ def resolve_attn_target_modules(config: Any) -> list[str]:
     raise AssertionError(
         f"model_type={model_type!r}: unknown attention module naming — extend "
         f"arch_adapters.resolve_attn_target_modules for this architecture."
+    )
+
+
+
+def resolve_lora_target_modules(config: Any) -> list[str] | str:
+    """ALL-linear LoRA targets (attention + dense MLP), resolved by model_type.
+
+    Returns either a suffix list or a fullmatch-regex string — peft.LoraConfig
+    accepts both. The llama family gets a REGEX, not suffixes, deliberately:
+    MoE members (qwen3_moe) name their per-expert Linears gate/up/down_proj
+    too, and suffix matching would wrap every expert (128 × 3 adapters per
+    layer — param blowup and glacial merges). The regex anchors MLP names to
+    the dense `.mlp.` path, so expert submodules (`.mlp.experts.N.*`) are left
+    alone. Archs where some layers lack a listed module are fine — a pattern
+    that matches nothing on a layer simply skips it.
+    """
+    model_type = getattr(resolve_text_config(config), "model_type", "")
+    if model_type in _LLAMA_FAMILY_MODEL_TYPES:
+        return (r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+                r"|.*\.mlp\.(gate_proj|up_proj|down_proj)")
+    if model_type == "gpt2":
+        return ["c_attn", "c_proj", "c_fc"]
+    if model_type in ("falcon", "gpt_neox"):
+        return ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+    if model_type == "phi3":
+        return ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+    raise AssertionError(
+        f"model_type={model_type!r}: unknown module naming — extend "
+        f"arch_adapters.resolve_lora_target_modules for this architecture."
     )

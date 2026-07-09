@@ -619,11 +619,11 @@ def main():
                 model = prepare_model_for_kbit_training(
                     model, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             model = get_peft_model(model, LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.config),
+                target_modules=resolve_lora_target_modules(model.config),
             ))
             model.print_trainable_parameters()
         vectors_ref = [None]
@@ -687,11 +687,11 @@ def main():
                 model.backbone = prepare_model_for_kbit_training(
                     model.backbone, use_gradient_checkpointing=args.gradient_checkpointing,
                 )
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             inject_adapter_in_model(LoraConfig(
                 r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
                 bias="none", task_type="CAUSAL_LM", use_rslora=True,
-                target_modules=resolve_attn_target_modules(model.backbone.config),
+                target_modules=resolve_lora_target_modules(model.backbone.config),
             ), model.backbone)
             # Train ONLY the LoRA adapters + the value_head; freeze the rest.
             for n_, p_ in model.named_parameters():
@@ -1008,11 +1008,16 @@ def main():
                       for n, p in model.named_parameters()
                       if ("lora_" in n) or n.startswith("value_head")}
                 save_file(sd, str(out_dir / "ar_lora_value_head.safetensors"))
+                from nla.utils.arch_adapters import resolve_lora_target_modules
                 (out_dir / "ar_meta.json").write_text(json.dumps({
                     "ar_num_layers": args.ar_num_layers,
                     "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
                     "quant": args.quant,
-                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    # Echo the ACTUAL resolved targets (list or regex str; both
+                    # json-safe and both accepted by LoraConfig at merge time) —
+                    # a hardcoded list here silently broke fused-QKV archs and
+                    # would mis-merge all-linear adapters as attn-only.
+                    "target_modules": resolve_lora_target_modules(model.backbone.config),
                     # Whether the backbone's final RMSNorm was stripped at init.
                     # RL must rebuild the critic the same way or predictions
                     # silently shift (pre-2026-06 ckpts: norm kept = False).

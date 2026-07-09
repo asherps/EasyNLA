@@ -1090,10 +1090,10 @@ def main():
         actor = AutoModelForCausalLM.from_pretrained(
             args.av_ckpt, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
         ).to(device)
-        from nla.utils.arch_adapters import resolve_attn_target_modules
+        from nla.utils.arch_adapters import resolve_lora_target_modules
         lora_cfg = LoraConfig(
             r=args.lora_r, lora_alpha=args.lora_alpha,
-            target_modules=resolve_attn_target_modules(actor.config),
+            target_modules=resolve_lora_target_modules(actor.config),
             lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
             use_rslora=args.use_rslora,
         )
@@ -1168,10 +1168,10 @@ def main():
             # _inner_transformer(self.backbone) path intact (get_peft_model would
             # wrap it and break that). Zero-init LoRA -> starts == warmstart.
             from peft import LoraConfig as _ARLoraCfg, inject_adapter_in_model
-            from nla.utils.arch_adapters import resolve_attn_target_modules
+            from nla.utils.arch_adapters import resolve_lora_target_modules
             inject_adapter_in_model(
                 _ARLoraCfg(r=args.ar_lora_r, lora_alpha=args.ar_lora_alpha,
-                           target_modules=resolve_attn_target_modules(critic.backbone.config),
+                           target_modules=resolve_lora_target_modules(critic.backbone.config),
                            lora_dropout=0.0, bias="none", task_type="CAUSAL_LM",
                            use_rslora=True),
                 critic.backbone)
