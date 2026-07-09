@@ -88,7 +88,7 @@ python -m nla.train_sft --mode av --base-ckpt <your/model> \
   --parquet /data/nla/<run>/av_sft_shuf.parquet \
   --sidecar /data/nla/<run>/av_sft_shuf.parquet \
   --save-dir /ckpts/nla/<run>_av \
-  --num-steps 1000 --batch-size 64 --gradient-accumulation-steps 1 \
+  --batch-size 64 --gradient-accumulation-steps 1 \
   --use-lora --quant 4bit --lora-r 128 --lora-alpha 16 \
   --lr 1e-4 --min-lr 1e-5 --lr-warmup-steps 50 --max-grad-norm 1.0 \
   --save-every 500 --wandb-project nla-<run> --wandb-name av_sft --seed 0
@@ -113,7 +113,7 @@ python -m nla.train_sft --mode ar --base-ckpt <your/model> \
   --parquet /data/nla/<run>/ar_sft_shuf.parquet \
   --sidecar /data/nla/<run>/ar_sft_shuf.parquet \
   --save-dir /ckpts/nla/<run>_ar \
-  --num-steps 1000 --batch-size 64 --gradient-accumulation-steps 1 \
+  --batch-size 64 --gradient-accumulation-steps 1 \
   --use-lora --quant 4bit --lora-r 128 --lora-alpha 16 \
   --ar-num-layers <layer_index + 1> \
   --lr 2e-5 --min-lr 2e-6 --lr-warmup-steps 50 --max-grad-norm 1.0 \

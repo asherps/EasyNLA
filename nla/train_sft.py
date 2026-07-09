@@ -491,7 +491,11 @@ def main():
     p.add_argument("--sidecar", default=None,
                    help="Sidecar source (defaults to --parquet for the dataset sidecar)")
     p.add_argument("--save-dir", required=True)
-    p.add_argument("--num-steps", type=int, default=200)
+    p.add_argument("--num-steps", type=int, default=None,
+                   help="Optimizer steps. Default (None) = exactly ONE EPOCH of the "
+                        "dataset: ceil(rows / (batch_size × grad_accum)). A fixed "
+                        "step default silently under/overtrains as dataset size "
+                        "changes (1000 steps was ~1/4 epoch on a 250k-row split).")
     p.add_argument("--batch-size", type=int, default=64,
                    help="Per-forward batch (= 'micro batch'). Effective batch = "
                         "batch_size × gradient_accumulation_steps.")
@@ -715,6 +719,12 @@ def main():
     print(f"[data] loading {args.parquet} (max_rows={args.max_rows})", flush=True)
     rows = load_sft_dataset(args.parquet, n_max=args.max_rows, mode=args.mode)
     print(f"[data] {len(rows)} rows", flush=True)
+    if args.num_steps is None:
+        eff_batch = args.batch_size * args.gradient_accumulation_steps
+        args.num_steps = math.ceil(len(rows) / eff_batch)
+        print(f"[steps] --num-steps not given → one epoch: "
+              f"ceil({len(rows)} rows / {eff_batch} eff. batch) = {args.num_steps} steps",
+              flush=True)
     if args.mode == "ar" and cfg.critic_suffix_ids:
         # One-time suffix-anchor sanity check (the sidecar field's stated
         # purpose): the tokenized critic prompt must end with the expected
