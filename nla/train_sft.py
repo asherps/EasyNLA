@@ -888,7 +888,8 @@ def main():
             try:
                 (loss / grad_accum).backward()
             finally:
-                vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
+                if vectors_ref is not None:  # AR mode has no injection ref
+                    vectors_ref[0] = None   # clear only AFTER backward (checkpoint recompute done)
             accum_loss += loss.item()
             accum_n += 1
 
