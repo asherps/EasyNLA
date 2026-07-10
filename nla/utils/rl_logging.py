@@ -56,6 +56,7 @@ def build_step_log(
     wall_s,
     shape_terms=None,
     marker_bad_count=None,
+    steer_unverified_count=None,
     inject_masked_count=None,
     steer_apply_count=None,
     steer_apply_rate=None,
@@ -78,6 +79,9 @@ def build_step_log(
         # i.e. redundant with av/kl_to_ref. Watch reward/mean, fve_pct, kl_to_ref, grad_norm.
         "av/grad_norm": gn,
         "av/kl_to_ref": grpo_metrics.get("kl_mean", 0.0),
+        "av/sampler_logp_absdiff_mean": grpo_metrics.get("sampler_logp_absdiff_mean", float("nan")),
+        "av/sampler_logp_absdiff_max": grpo_metrics.get("sampler_logp_absdiff_max", float("nan")),
+        "av/sampler_mismatch_masked": grpo_metrics.get("sampler_mismatch_masked", 0),
         "av/entropy": grpo_metrics.get("entropy", 0.0),   # mean policy entropy over response tokens (nats)
         "av/advantage_mean": adv.mean().item(),
         "av/advantage_std": adv.std().item(),
@@ -106,6 +110,10 @@ def build_step_log(
     #   these can't be eroded by RL shifting the output distribution.
     if marker_bad_count is not None:
         log["av/marker_bad_count"] = marker_bad_count
+    if steer_unverified_count is not None:
+        # per-request steering coverage log failures (patch_vllm_lens fix (4)):
+        # the silent-lost-injection detector; want 0
+        log["av/steer_unverified_count"] = steer_unverified_count
     if inject_masked_count is not None:
         log["av/inject_masked_count"] = inject_masked_count
     if steer_apply_count is not None:

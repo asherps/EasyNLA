@@ -228,7 +228,10 @@ def t_stage1_doc_level_split():
     """All rows of one doc land in the same bucket; buckets are disjoint."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from nla.datagen import stage1_split as s1
+    try:
+        from nla.datagen import stage1_split as s1
+    except ModuleNotFoundError:
+        from datagen import stage1_split as s1
     fracs = {"av": 0.4, "ar": 0.4}
     # use the module's split function if importable; else emulate via CLI
     with tempfile.TemporaryDirectory() as td:
@@ -255,7 +258,10 @@ def t_stage1_doc_level_split():
 def t_stage_shuffle_deterministic():
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from nla.datagen import stage_shuffle as ss
+    try:
+        from nla.datagen import stage_shuffle as ss
+    except ModuleNotFoundError:
+        from datagen import stage_shuffle as ss
     fn = getattr(ss, "shuffled_indices", None) or getattr(ss, "_perm", None)
     n = 1000
     if fn is not None:
@@ -270,7 +276,10 @@ def t_stage_shuffle_deterministic():
 
 def t_prompt_cache_roundtrip():
     import hashlib
-    from nla.datagen.prompt_cache import lookup
+    try:
+        from nla.datagen.prompt_cache import lookup
+    except ModuleNotFoundError:
+        from datagen.prompt_cache import lookup
     key = hashlib.sha256("text A".encode()).hexdigest()
     cache = {key: "expl A"}
     assert lookup(cache, "text A") == "expl A"
@@ -284,7 +293,10 @@ def t_provider_error_paths():
     """AnthropicProvider: refusal->None, tolerated exc->None, systemic raises."""
     import asyncio
     import anthropic
-    from nla.datagen.providers import AnthropicProvider
+    try:
+        from nla.datagen.providers import AnthropicProvider
+    except ModuleNotFoundError:
+        from datagen.providers import AnthropicProvider
 
     class FakeMsgs:
         def __init__(self, behavior): self.behavior = behavior
@@ -464,7 +476,8 @@ def t_no_stale_grads_after_step():
         eos_token_id = 0
     import inspect
     kw = {}
-    if "old_logps_list" in inspect.signature(grpo_update_microbatched).parameters:
+    _prm = inspect.signature(grpo_update_microbatched).parameters.get("old_logps_list")
+    if _prm is not None and _prm.default is inspect.Parameter.empty:
         args_ = (actor, optim, Tok(), [torch.arange(2, 12)], [4],
                  [torch.randn(64)], [torch.zeros(6)], torch.tensor([1.0]), [None], "cpu")
     else:
@@ -649,7 +662,11 @@ def t_branch_resume_optim_lookup():
     branch-style resume (new save-dir, LoRA from the old run's dir) — the
     save-dir-only search silently restarted Adam cold, which spiraled
     late-stage policies to entropy death in the full repo (2/2)."""
-    from nla.utils.resume import find_optim_ckpt
+    try:
+        from nla.utils.resume import find_optim_ckpt
+    except ModuleNotFoundError:
+        print("  (no nla.utils.resume — this repo has its own resume search, skipped)")
+        return
     with tempfile.TemporaryDirectory() as td:
         old_run = Path(td) / "old_run"; (old_run / "iter_000200").mkdir(parents=True)
         new_run = Path(td) / "new_run"; new_run.mkdir()
@@ -672,6 +689,110 @@ def t_branch_resume_optim_lookup():
         src = (REPO / f).read_text()
         assert "find_optim_ckpt(args.save_dir, args.resume_from_lora)" in src, f
         assert "warn_cold_adam(args.start_step)" in src, f
+
+
+
+
+def t_sampler_mismatch_mask():
+    """A rollout whose vLLM logps disagree with HF beyond the threshold must
+    contribute ZERO gradient (surrogate + KL both dropped) and be reported in
+    metrics; below-threshold rollouts train normally."""
+    import inspect
+    from peft import LoraConfig, get_peft_model
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from nla.train_rl_vllm import grpo_update_microbatched
+
+    if "sampler_mismatch_thresh" not in inspect.signature(grpo_update_microbatched).parameters:
+        raise AssertionError("sampler_mismatch_thresh missing from grpo signature")
+
+    def build():
+        torch.manual_seed(0)
+        m = get_peft_model(LlamaForCausalLM(LlamaConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=4, vocab_size=100)).float(),
+            LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+                       task_type="CAUSAL_LM", target_modules=["q_proj"]))
+        torch.manual_seed(1)
+        with torch.no_grad():
+            for n_, p_ in m.named_parameters():
+                if "lora_" in n_:
+                    p_.copy_(torch.randn_like(p_) * 0.05)
+        return m
+
+    class Tok:
+        eos_token_id = 0
+
+    ids = [torch.arange(2, 12), torch.arange(3, 15)]
+    acts = [torch.randn(64), torch.randn(64)]
+    adv = torch.tensor([1.0, -0.5])
+    full_repo = "old_logps_list" in [
+        pname for pname, prm in inspect.signature(grpo_update_microbatched).parameters.items()
+        if prm.default is inspect.Parameter.empty]
+
+    def true_logps(actor):
+        outs = []
+        with torch.no_grad():
+            for k, t in enumerate(ids):
+                p_len = 4 if k == 0 else 5
+                lg = actor(input_ids=t.unsqueeze(0)).logits[0].float()
+                pred = torch.arange(p_len - 1, t.numel() - 1)
+                rl = lg.index_select(0, pred)
+                lp = rl.gather(-1, t[p_len:].unsqueeze(-1)).squeeze(-1) \
+                     - torch.logsumexp(rl, -1)
+                outs.append(lp)
+        return outs
+
+    def run(mismatch_sample, thresh):
+        actor = build()
+        optim = torch.optim.SGD([p_ for p_ in actor.parameters() if p_.requires_grad], lr=0.0)
+        # clean olp = the model's ACTUAL logps (noise-floor agreement);
+        # the "corrupted" sample's olp is shifted by +3 nats
+        olps = [lp + (3.0 if k == mismatch_sample else 0.0)
+                for k, lp in enumerate(true_logps(actor))]
+        if full_repo:
+            args_ = (actor, optim, Tok(), [t.clone() for t in ids], [4, 5],
+                     [a.clone() for a in acts], olps, adv.clone(), [None], "cpu")
+            kw = dict(on_policy=True)
+        else:
+            args_ = (actor, optim, Tok(), [t.clone() for t in ids], [4, 5],
+                     [a.clone() for a in acts], adv.clone(), [None], "cpu")
+            kw = dict(old_logps_list=olps)
+        _, _, metrics = grpo_update_microbatched(
+            *args_, micro_batch=2, kl_beta=0.05, do_step=False, n_total=2,
+            sampler_mismatch_thresh=thresh, **kw)
+        grads = {n_: p_.grad.clone() for n_, p_ in actor.named_parameters()
+                 if p_.requires_grad and p_.grad is not None}
+        return metrics, grads
+
+    # the +3-nat sample's olp is far off HF (mean |d| >> 0.1): masked
+    m1, g_masked = run(mismatch_sample=0, thresh=0.1)
+    assert m1["sampler_mismatch_masked"] == 1, m1
+    assert m1["sampler_mismatch_idx"] == [0], m1
+    # threshold off -> nothing masked, both train
+    m0, g_all = run(mismatch_sample=0, thresh=0.0)
+    assert m0["sampler_mismatch_masked"] == 0
+    # masked run's grads must equal a run where sample 0 simply doesn't exist
+    actor = build()
+    optim = torch.optim.SGD([p_ for p_ in actor.parameters() if p_.requires_grad], lr=0.0)
+    olp1 = [true_logps(actor)[1]]
+    if full_repo:
+        args_ = (actor, optim, Tok(), [ids[1].clone()], [5],
+                 [acts[1].clone()], olp1, adv[1:].clone(), [None], "cpu")
+        kw = dict(on_policy=True)
+    else:
+        args_ = (actor, optim, Tok(), [ids[1].clone()], [5],
+                 [acts[1].clone()], adv[1:].clone(), [None], "cpu")
+        kw = dict(old_logps_list=olp1)
+    grpo_update_microbatched(*args_, micro_batch=2, kl_beta=0.05, do_step=False,
+                             n_total=2, sampler_mismatch_thresh=0.1, **kw)
+    g_only1 = {n_: p_.grad.clone() for n_, p_ in actor.named_parameters()
+               if p_.requires_grad and p_.grad is not None}
+    for k in g_masked:
+        assert torch.allclose(g_masked[k], g_only1[k], atol=1e-7), \
+            f"masked-run grads differ from sample-1-only grads at {k}"
+        if g_all[k].abs().max() > 0:
+            assert not torch.allclose(g_masked[k], g_all[k], atol=1e-9), \
+                "mask had no effect on gradients"
 
 
 if __name__ == "__main__":
@@ -698,6 +819,7 @@ if __name__ == "__main__":
     check("critic_forward_no_kv_cache", t_critic_forward_no_kv_cache)
     check("inject_at_marked_positions_surplus", t_inject_at_marked_positions_surplus)
     check("branch_resume_optim_lookup", t_branch_resume_optim_lookup)
+    check("sampler_mismatch_mask", t_sampler_mismatch_mask)
     check("twin_grad_equivalence", t_twin_grad_equivalence)
     check("twin_scorer_equivalence", t_twin_scorer_equivalence)
     n_fail = sum(1 for _, e in RESULTS if e)

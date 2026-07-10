@@ -68,6 +68,7 @@ NEW_APPLY_SIG = """def _apply_steering(
     end: int,
     abs_start: int,
     norm_ref: torch.Tensor | None = None,
+    log_key: str | None = None,
 ) -> None:
     \"\"\"Apply all matching steering vectors to a token slice *in-place*.
 
@@ -149,6 +150,7 @@ OLD_CALL = """            _apply_steering(
 NEW_CALL = """            _apply_steering(
                 per_req_steering[i], layer_idx, target, start, end, abs_start,
                 norm_ref,
+                log_key=per_req_log_key[i],
             )"""
 
 # --- Perf fix: O(1) steering lookup on the offline path -------------------
@@ -230,15 +232,158 @@ NEW_COUNT_INCR = (
     "                _NLA_STEER_APPLY_COUNT[0] += 1  # NLA: count this marker write"
 )
 
+
+# ---------------------------------------------------------------------------
+# Fix (4) — per-request steering COVERAGE log (2026-07-09 divergence hunt).
+#
+# The global write-event counter (_NLA_STEER_APPLY_COUNT) proved BLIND to the
+# lost-injection failure: ~1/few-hundred rollouts is generated with the
+# steering effectively absent while the counter reads exactly n_rollouts
+# (root cause writeup: experiment_log/july6/sampler-logp-divergence-rootcause.md).
+# This hunk set adds exact per-request accounting keyed by the offline path's
+# _steering_id (== "_steer_{prompt_idx}", trainer-known):
+#   covered  — marker-covering forward chunks at a steered layer
+#   applied  — steering writes actually performed
+#   positions— absolute positions written (must all == the marker)
+#   orphaned — chunks where the request carried a _steering_id but the
+#              steering payload was GONE from _steering_data (the cleared-
+#              data mechanism; counted once per forward at layer 0)
+# Invariants checked trainer-side (rollout_batch_vllm): entry exists,
+# orphaned == 0, applied == covered >= 1, set(positions) == {marker_pos}.
+
+OLD_STEERLOG_GLOBAL = """def get_and_reset_steer_count() -> int:
+    \"\"\"Return marker position-writes since the last call, then reset to 0.\"\"\"
+    c = _NLA_STEER_APPLY_COUNT[0]
+    _NLA_STEER_APPLY_COUNT[0] = 0
+    return c"""
+NEW_STEERLOG_GLOBAL = OLD_STEERLOG_GLOBAL + """
+
+
+# NLA per-request steering coverage log (see patch_vllm_lens.py fix (4)):
+# {log_key: {"covered": int, "applied": int, "positions": [int], "orphaned": int}}
+_NLA_STEER_LOG: dict = {}
+
+
+def _nla_steer_entry(log_key):
+    return _NLA_STEER_LOG.setdefault(
+        log_key, {"covered": 0, "applied": 0, "positions": [], "orphaned": 0})
+
+
+def get_and_reset_steer_log() -> dict:
+    \"\"\"Return the per-request steering coverage log, then reset it.\"\"\"
+    log = {k: dict(v) for k, v in _NLA_STEER_LOG.items()}
+    _NLA_STEER_LOG.clear()
+    return log"""
+
+OLD_STEERLOG_SIG = """    abs_start: int,
+    norm_ref: torch.Tensor | None = None,
+) -> None:"""
+NEW_STEERLOG_SIG = """    abs_start: int,
+    norm_ref: torch.Tensor | None = None,
+    log_key: str | None = None,
+) -> None:"""
+
+OLD_STEERLOG_POS = """            abs_end = abs_start + n_tokens
+            for pi, abs_pos in enumerate(pos_indices):"""
+NEW_STEERLOG_POS = """            abs_end = abs_start + n_tokens
+            if log_key is not None and any(
+                    abs_start <= _p < abs_end for _p in pos_indices):
+                _nla_steer_entry(log_key)["covered"] += 1
+            for pi, abs_pos in enumerate(pos_indices):"""
+
+OLD_STEERLOG_WRITE = """                _NLA_STEER_APPLY_COUNT[0] += 1  # NLA: count this marker write"""
+NEW_STEERLOG_WRITE = """                _NLA_STEER_APPLY_COUNT[0] += 1  # NLA: count this marker write
+                if log_key is not None:
+                    _e = _nla_steer_entry(log_key)
+                    _e["applied"] += 1
+                    _e["positions"].append(int(abs_pos))"""
+
+OLD_STEERLOG_PHASE1 = """        configs = _find_steering_configs(extension, req_id, extra)
+        per_req_steering.append(configs)
+        if configs:
+            needs_steering = True"""
+NEW_STEERLOG_PHASE1 = """        configs = _find_steering_configs(extension, req_id, extra)
+        per_req_steering.append(configs)
+        _sid = (extra or {}).get("_steering_id")
+        per_req_log_key.append(_sid or req_id)
+        # ORPHAN: the request claims steering (_steering_id set) but the
+        # payload is gone from _steering_data — the exact silent-lost-
+        # injection mechanism. Count once per forward (layer 0 only; this
+        # hook fires per layer).
+        if _sid is not None and not configs and layer_idx == 0:
+            _nla_steer_entry(_sid)["orphaned"] += 1
+        if configs:
+            needs_steering = True"""
+
+OLD_STEERLOG_PHASE1_INIT = """    per_req_steering: list[list[SteeringVector]] = []
+    needs_steering = False"""
+NEW_STEERLOG_PHASE1_INIT = """    per_req_steering: list[list[SteeringVector]] = []
+    per_req_log_key: list = []
+    needs_steering = False"""
+
+OLD_STEERLOG_CALL = """            _apply_steering(
+                per_req_steering[i], layer_idx, target, start, end, abs_start,
+                norm_ref,
+            )"""
+NEW_STEERLOG_CALL = """            _apply_steering(
+                per_req_steering[i], layer_idx, target, start, end, abs_start,
+                norm_ref,
+                log_key=per_req_log_key[i],
+            )"""
+
+
+# ---------------------------------------------------------------------------
+OLD_SEQLENS = """        # Retrieve seq_lens for absolute position calculation.
+        # seq_lens may be a tensor or a list depending on vLLM version.
+        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)"""
+NEW_SEQLENS = """        # Retrieve seq_lens for absolute position calculation.
+        # seq_lens may be a tensor or a list depending on vLLM version.
+        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
+        if seq_lens is None and hasattr(attn_metadata, "values"):
+            # vLLM v1: attn_metadata is a dict of per-KV-group metadata — the
+            # bare getattr above always returned None here, sending every chunk
+            # into the abs_start=0 fallback and silently losing/mis-positioning
+            # steering on split prefills (patch_vllm_lens fix (5)).
+            for _meta5 in attn_metadata.values():
+                if getattr(_meta5, "seq_lens", None) is not None:
+                    seq_lens = _meta5.seq_lens
+                    break"""
+
+
+# ---------------------------------------------------------------------------
+# Baseline tolerance (2026-07-09). pip's vllm-lens 1.1.x ships with the fix
+# (1)-(3) content ALREADY incorporated upstream, so on a FRESH venv the
+# APPLY_SIG and CALL hunks match neither their OLD (pre-fix-1) nor their NEW
+# (with log_key) text and the patcher REFUSED to run - leaving new pods
+# entirely unpatched for fixes (4)+(5) while provisioning printed a
+# reassuring 'already patched (all 8 hunks)' from its older patcher copy
+# (root cause of the lmw7ge82 stale-engine incident). SATISFIED_* mark that
+# upstreamed baseline as acceptable for those hunks: their semantic content
+# (norm_ref) is present, and the STEERLOG hunks add log_key starting from
+# exactly this baseline text.
+# ---------------------------------------------------------------------------
+SATISFIED_APPLY_SIG = 'def _apply_steering(\n    configs: list[SteeringVector],\n    layer_idx: int,\n    target: torch.Tensor,\n    start: int,\n    end: int,\n    abs_start: int,\n    norm_ref: torch.Tensor | None = None,\n) -> None:\n    """Apply all matching steering vectors to a token slice *in-place*.\n\n    ``target`` is the (already-cloned) output tensor.  ``start``/``end``\n    are batch-relative indices, ``abs_start`` is the absolute sequence\n    position of the first token in ``target[start:end]``.\n\n    ``norm_ref`` is the tensor whose per-position L2 norm anchors\n    ``norm_match``. For models whose decoder layers return\n    ``(hidden_states, residual)`` tuples (Qwen/Llama in vLLM), the TRUE\n    residual stream is ``hidden_states + residual`` — norm-matching against\n    ``hidden_states`` alone mis-scales the steering vector. Defaults to\n    ``target`` for plain (non-tuple) layer outputs.\n    """\n    if norm_ref is None:\n        norm_ref = target\n    n_tokens = end - start'
+
+SATISFIED_CALL = '            _apply_steering(\n                per_req_steering[i], layer_idx, target, start, end, abs_start,\n                norm_ref,\n            )'
+
+
 HUNKS = [
-    (OLD_APPLY_SIG, NEW_APPLY_SIG),
+    (OLD_APPLY_SIG, NEW_APPLY_SIG, [SATISFIED_APPLY_SIG]),
+    (OLD_SEQLENS, NEW_SEQLENS),
     (OLD_BCAST, NEW_BCAST),
     (OLD_POS, NEW_POS),
     (OLD_HOOK, NEW_HOOK),
-    (OLD_CALL, NEW_CALL),
+    (OLD_CALL, NEW_CALL, [SATISFIED_CALL]),
     (OLD_FIND, NEW_FIND),
     (OLD_COUNT_GLOBAL, NEW_COUNT_GLOBAL),
     (OLD_COUNT_INCR, NEW_COUNT_INCR),
+    (OLD_STEERLOG_GLOBAL, NEW_STEERLOG_GLOBAL),
+    (OLD_STEERLOG_SIG, NEW_STEERLOG_SIG),
+    (OLD_STEERLOG_POS, NEW_STEERLOG_POS),
+    (OLD_STEERLOG_WRITE, NEW_STEERLOG_WRITE),
+    (OLD_STEERLOG_PHASE1_INIT, NEW_STEERLOG_PHASE1_INIT),
+    (OLD_STEERLOG_PHASE1, NEW_STEERLOG_PHASE1),
+    (OLD_STEERLOG_CALL, NEW_STEERLOG_CALL),
 ]
 
 
@@ -252,12 +397,14 @@ def main() -> int:
     # (lets us add new hunks to an already-partially-patched file). A hunk whose
     # OLD text is missing AND whose NEW text is absent = version drift -> refuse.
     to_apply = []
-    for i, (old, new) in enumerate(HUNKS):
-        if new in src:
+    for i, hunk in enumerate(HUNKS):
+        old, new = hunk[0], hunk[1]
+        satisfied = hunk[2] if len(hunk) > 2 else []
+        if new in src or any(alt in src for alt in satisfied):
             continue
         if old not in src:
-            print(f"[patch_vllm_lens] hunk {i} not found (neither OLD nor NEW) "
-                  f"— vllm_lens version drift? Refusing to patch {path}")
+            print(f"[patch_vllm_lens] hunk {i} not found (neither OLD, NEW, nor a "
+                  f"satisfied baseline) — vllm_lens version drift? Refusing to patch {path}")
             return 1
         to_apply.append((old, new))
 

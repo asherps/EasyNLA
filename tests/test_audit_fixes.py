@@ -147,7 +147,9 @@ def t3_n_total_grad_scaling():
             eos_token_id = 0
         import inspect
         params = inspect.signature(grpo_update_microbatched).parameters
-        if "old_logps_list" in params:   # full-repo signature (on-policy ignores them)
+        _olp_prm = params.get("old_logps_list")
+        if _olp_prm is not None and _olp_prm.default is inspect.Parameter.empty:
+            # full-repo signature: old_logps POSITIONAL (on-policy ignores them)
             old_lps = [torch.zeros(ids[0].numel() - 4), torch.zeros(ids[1].numel() - 5)]
             grpo_update_microbatched(
                 actor, optim, Tok(), ids, [4, 5], acts, old_lps, adv, [None], "cpu",
@@ -173,10 +175,17 @@ def t3_n_total_grad_scaling():
 
 # ---- 6: stage0 multigpu config-parse assert -----------------------------------
 def t6_stage0_multigpu_assert():
-    if (REPO / "scripts/datagen/stage0_multigpu.sh").exists():
-        print("  (script shipped in this repo — assert not applicable, OK)")
+    try:
+        from nla.datagen import run_pipeline as rp
+    except ModuleNotFoundError:
+        from datagen import run_pipeline as rp
+    # skip when the repo ships the wrapper this run_pipeline references
+    import inspect as _insp
+    import re as _re
+    _m = _re.search(r'scripts/datagen/\S*multigpu\S*\.sh', _insp.getsource(rp))
+    if _m and (REPO / _m.group(0)).exists():
+        print(f"  (script shipped in this repo ({_m.group(0)}) — assert not applicable, OK)")
         return
-    from nla.datagen import run_pipeline as rp
     cfg = {
         "stage0": {"multigpu": True},
         "corpus": {"name": "dummy", "length": 1, "config": None},

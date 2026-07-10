@@ -229,6 +229,7 @@ def rollout_batch_vllm(
     flat_prompts = []
     flat_steering = []
     flat_meta = []  # (prompt_idx, group_idx, prompt_len)
+    flat_marker_pos = []  # abs marker position per flat request (steer-log check)
     for pi, (prompt_text, activation) in enumerate(prompts_with_activations):
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         # SteeringVector + single-marker logic shared with the offline AV decoder
@@ -239,6 +240,7 @@ def rollout_batch_vllm(
             flat_prompts.append(TokensPrompt(prompt_token_ids=prompt_ids))
             flat_steering.append(sv)
             flat_meta.append((pi, gi, len(prompt_ids)))
+            flat_marker_pos.append(marker_pos)
 
     sampling_params_list = [
         SamplingParams(
@@ -251,6 +253,14 @@ def rollout_batch_vllm(
         for sv in flat_steering
     ]
 
+    # Reset the per-request steer log BEFORE generating: entries left by any
+    # prior steered generate under the same _steer_{idx} keys would merge into
+    # this call's and false-flag verification.
+    try:
+        from nla.utils.vllm_steer import read_reset_steer_log as _rrsl
+        llm.apply_model(_rrsl)
+    except Exception:
+        pass
     outputs = llm.generate(flat_prompts, sampling_params_list)
     assert len(outputs) == len(flat_prompts)
 
@@ -296,6 +306,44 @@ def rollout_batch_vllm(
             # instead removed that gradient and collapsed the policy, twice.)
             "truncated": getattr(out0, "finish_reason", None) == "length",
         })
+    # ---- per-request steering-coverage verification (patch_vllm_lens fix (4)).
+    # The global write counter is BLIND to the silent-lost-injection event
+    # (~1/few-hundred rollouts generated WITHOUT the injection while text/
+    # marker/count checks all read clean — detected only by vllm-vs-hf logp
+    # divergence). The patched worker keeps an exact per-request log keyed by
+    # "_steer_{flat_idx}": verify applied == covered >= 1, zero orphaned
+    # chunks (steering payload missing), every write ON the marker. In this
+    # trainer's one-request-per-rollout layout the flag is per-ROLLOUT.
+    # Degrades gracefully on an unpatched venv (empty log => all verified).
+    for r in responses:
+        r["steer_verified"] = True
+    try:
+        from nla.utils.vllm_steer import read_reset_steer_log
+        _logs = llm.apply_model(read_reset_steer_log)
+        _steer_log = _logs[0] if _logs else None
+    except Exception:
+        _steer_log = None
+    if isinstance(_steer_log, dict) and _steer_log:
+        _flagged = []
+        for ri in range(len(responses)):
+            e = _steer_log.get(f"_steer_{ri}")
+            ok = (
+                e is not None
+                and e.get("orphaned", 0) == 0
+                and e.get("applied", 0) >= 1
+                and e.get("applied") == e.get("covered")
+                and set(e.get("positions", [])) == {flat_marker_pos[ri]}
+            )
+            if not ok:
+                responses[ri]["steer_verified"] = False
+                _flagged.append((ri, e))
+        if _flagged:
+            print(f"[rollout] STEER-LOG: {len(_flagged)}/{len(responses)} requests "
+                  f"FAILED coverage verification (flagged steer_verified=False). "
+                  + "; ".join(f"req {ri} (marker {flat_marker_pos[ri]}): {e}"
+                              for ri, e in _flagged[:4]),
+                  flush=True)
+
     return responses
 
 
@@ -680,6 +728,7 @@ def grpo_update_microbatched(
     micro_batch=2, kl_beta=0.04, max_grad_norm=1.0,
     zero_grad_first=True, do_step=True, loss_scale=1.0,
     dp_world_size=1, kl_estimator="k3", kl_topk=64, n_total=None,
+    old_logps_list=None, sampler_mismatch_thresh=0.0,
 ):
     """Fused micro-batched forward+loss+backward for GRPO.
 
@@ -700,6 +749,12 @@ def grpo_update_microbatched(
     sample_losses_log = []
     sample_kls_log = []
     sample_entropy_log = []   # mean per-token policy entropy over response tokens (nats)
+    sample_lpdiff_log = []    # mean |vllm_lp - hf_lp| per sample (sampler<->trainer divergence)
+    sample_lpdiff_max_log = []
+    mismatch_masked_idx = []  # gradient-dropped samples: mean |dlogp| > thresh =>
+                              # vLLM generated them under a DIFFERENT effective
+                              # conditioning (e.g. silently lost injection —
+                              # clean text/marker/steer-count can't detect it)
     advantages = advantages.detach()  # no grad through advantage
     actor_sync_wait_s = actor_allreduce_s = 0.0   # DP grad-sync timing (set at do_step)
     for cs in range(0, n, micro_batch):
@@ -762,6 +817,27 @@ def grpo_update_microbatched(
             # on-policy: no ratio, single GPU0 pass = new_lp
             if new_lp.numel() == 0:
                 continue
+            # sampler<->trainer consistency: vLLM's sampled logps are free.
+            # A rollout whose mean |vllm_lp - hf_lp| exceeds the threshold was
+            # generated under a DIFFERENT effective conditioning (measured case:
+            # ~1/few-hundred rollouts silently lose the activation injection;
+            # noise floor ~0.02, corrupted rollouts 0.2-0.6). Mask its gradient:
+            # surrogate AND KL (k3 can see exp(6-8 nat) weights on such tokens).
+            # Its reward stays in the group baseline; n_total keeps dropped
+            # samples acting as zeros.
+            _olp = (old_logps_list[i] if old_logps_list is not None
+                    and i < len(old_logps_list) else None)
+            if _olp is not None and _olp.numel() > 0:
+                with torch.no_grad():
+                    _olp = _olp.to(device)
+                    _n = min(_olp.numel(), new_lp.numel())
+                    _d = (new_lp.detach()[:_n] - _olp[:_n]).abs()
+                    sample_lpdiff_log.append(float(_d.mean()))
+                    sample_lpdiff_max_log.append(float(_d.max()))
+                if (sampler_mismatch_thresh > 0
+                        and sample_lpdiff_log[-1] > sampler_mismatch_thresh):
+                    mismatch_masked_idx.append(i)
+                    continue
             sample_loss, kl_m = grpo_token_loss(
                 new_lp, ref_lp, advantages[i], kl_beta=kl_beta, kl_tok=kl_tok,
             )
@@ -811,6 +887,10 @@ def grpo_update_microbatched(
     metrics = {
         "kl_mean": float(np.mean(sample_kls_log)) if sample_kls_log else 0.0,
         "entropy": float(np.mean(sample_entropy_log)) if sample_entropy_log else 0.0,
+        "sampler_logp_absdiff_mean": float(np.mean(sample_lpdiff_log)) if sample_lpdiff_log else float("nan"),
+        "sampler_logp_absdiff_max": float(np.max(sample_lpdiff_max_log)) if sample_lpdiff_max_log else float("nan"),
+        "sampler_mismatch_masked": len(mismatch_masked_idx),
+        "sampler_mismatch_idx": mismatch_masked_idx,
         "sync_wait_s": actor_sync_wait_s,   # DP: idle waiting for slowest rank's backward
         "allreduce_s": actor_allreduce_s,   # DP: actor grad all-reduce transport
     }
@@ -984,6 +1064,13 @@ def main():
                         "(lowest metric noise).")
     p.add_argument("--judge-concurrency", type=int, default=64,
                    help="Concurrent judge API calls for text_judges.")
+    p.add_argument("--sampler-mismatch-thresh", type=float, default=0.1,
+                   help="Mask a rollout's gradient (surrogate + KL + critic example) "
+                        "when its mean |vllm_logp - hf_logp| exceeds this. Detects "
+                        "rollouts vLLM generated under a different effective "
+                        "conditioning (e.g. a silently lost injection, ~1/few-hundred; "
+                        "engine-noise floor ~0.02, corrupted rollouts 0.2-0.6) that "
+                        "text/marker/steer-count checks cannot see. 0 = off.")
     p.add_argument("--eval-temperature", type=float, default=None,
                    help="Sampling temperature for the per-step eval generation. "
                         "Default None = use --temperature. Set 0.0 for GREEDY eval "
@@ -1372,6 +1459,35 @@ def main():
                    "GROUP_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
                    "TORCHELASTIC_USE_AGENT_STORE", "TORCHELASTIC_MAX_RESTARTS"):
             os.environ.pop(_k, None)
+    # LENS-VINTAGE GUARD. The steer verifier and counter degrade gracefully
+    # when the vllm-lens patch is missing — the per-request log RPC returns {}
+    # and every check stays silently green while the engine loses or
+    # mis-positions injections under chunked prefill. Graceful degradation is
+    # right mid-run; it is WRONG at startup: require the installed worker file
+    # to carry the hunks this trainer depends on, and refuse to train
+    # otherwise. Override (e.g. a deliberately unpatched A/B) with
+    # NLA_ALLOW_STALE_LENS=1.
+    if os.environ.get("NLA_ALLOW_STALE_LENS") != "1":
+        import vllm_lens._worker_ext as _wx_check
+        _wx_src = Path(_wx_check.__file__).read_text()
+        _lens_markers = {
+            "chunked-prefill seq_lens fix (dict-aware)": "_meta5",
+            "per-request steer log": "get_and_reset_steer_log",
+            "log_key call wiring": "log_key=per_req_log_key",
+            "steering-apply counter": "get_and_reset_steer_count",
+        }
+        _lens_missing = [name for name, marker in _lens_markers.items()
+                         if marker not in _wx_src]
+        if _lens_missing:
+            raise SystemExit(
+                f"[fatal] installed vllm-lens is missing required patch hunks: "
+                f"{_lens_missing} in {_wx_check.__file__}. Training on this "
+                f"engine silently loses/mis-positions injections under chunked "
+                f"prefill and blinds the steer verifier. Run "
+                f"`<venv>/bin/python utils/patch_vllm_lens.py` (idempotent) and "
+                f"relaunch, or set NLA_ALLOW_STALE_LENS=1 to proceed anyway."
+            )
+        del _wx_check, _wx_src
     from vllm import LLM as VLLM
     llm = VLLM(
         model=args.av_ckpt,
@@ -1721,6 +1837,7 @@ def main():
         all_prompt_group = []
         all_old_logps = []
         all_truncated = []
+        all_steer_verified = []
         for r in responses:
             expl = extract_explanation(r["text"])
             all_full_ids.append(r["full_ids"])
@@ -1732,6 +1849,7 @@ def main():
             all_prompt_group.append(r["prompt_idx"])
             all_old_logps.append(r["old_logp"].to(device))
             all_truncated.append(bool(r.get("truncated", False)))
+            all_steer_verified.append(bool(r.get("steer_verified", True)))
 
         # ---- per-rollout injection-success checks -> training mask ----
         # Don't train on rollouts whose injection failed: they carry no usable
@@ -1753,10 +1871,14 @@ def main():
             for i in range(len(all_full_ids))
         ]
         inject_ok = [
-            (not cjk_fail[i]) and marker_ok[i] for i in range(len(all_full_ids))
+            # steer_verified: per-request coverage log (patch_vllm_lens fix (4)) —
+            # catches the silent-lost-injection event that cjk/marker/count miss
+            (not cjk_fail[i]) and marker_ok[i] and all_steer_verified[i]
+            for i in range(len(all_full_ids))
         ]
         n_inject_fail = int(sum(cjk_fail))                       # CJK count (existing metric)
         n_marker_bad = int(sum(1 for m in marker_ok if not m))   # marker-drift count
+        n_steer_unverified = int(sum(1 for v in all_steer_verified if not v))
         n_inject_masked = int(sum(1 for ok in inject_ok if not ok))
         inject_ok_t = torch.tensor(inject_ok, dtype=torch.bool, device=device)
         # Truncated rollouts (hit the max_new_tokens cap, finish_reason=length) are
@@ -1857,6 +1979,7 @@ def main():
         upd_full_ids = [all_full_ids[i] for i in keep]
         upd_prompt_lens = [all_prompt_lens[i] for i in keep]
         upd_activations = [all_activations[i] for i in keep]
+        upd_old_logps = [all_old_logps[i] for i in keep]
         upd_adv = adv.index_select(0, torch.tensor(keep, device=device))
         actor.train()
         mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
@@ -1870,6 +1993,8 @@ def main():
             loss_scale=1.0 / accum, dp_world_size=world_size,
             kl_estimator=args.kl_estimator, kl_topk=args.kl_topk,
             n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
+            old_logps_list=upd_old_logps,
+            sampler_mismatch_thresh=args.sampler_mismatch_thresh,
         )
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         # Build a scalar-tensor stand-in for the existing logging path that
@@ -1916,7 +2041,14 @@ def main():
             crit_golds = []
             # `keep` excludes injection-failed rollouts (cjk/marker) — don't train the
             # AR reconstructor on garbage explanations (corrupt regression targets).
+            # Also exclude sampler-mismatch-masked rollouts (see grpo): their
+            # explanation was generated WITHOUT the injected conditioning — a
+            # mismatched (explanation, activation) pair would teach the critic noise.
+            _mm = grpo_metrics.get("sampler_mismatch_idx", []) if grpo_metrics else []
+            _mm_orig = {keep[j] for j in _mm if j < len(keep)}
             for i in keep:
+                if i in _mm_orig:
+                    continue
                 expl = all_explanations[i]
                 act = all_activations[i]
                 if expl is None:
@@ -2041,6 +2173,7 @@ def main():
             wall_s=time.time() - t0,
             shape_terms=shape_terms,
             marker_bad_count=n_marker_bad,
+            steer_unverified_count=n_steer_unverified,
             inject_masked_count=n_inject_masked,
             steer_apply_count=(steer_apply_count if steer_apply_count >= 0 else None),
             steer_apply_rate=(steer_apply_rate if steer_apply_count >= 0 else None),

@@ -57,6 +57,22 @@ def read_reset_steer_count(model):
         return -1
 
 
+def read_reset_steer_log(model):
+    """vLLM `apply_model` helper (runs IN each worker): fetch+reset the
+    PER-REQUEST steering coverage log the patched vllm-lens maintains
+    (patch_vllm_lens fix (4)): {log_key: {covered, applied, positions,
+    orphaned}}, keyed by the offline path's _steering_id ("_steer_{idx}").
+    Returns {} when the patch (or the log hunk) isn't applied, so callers
+    degrade gracefully. Must live in an importable module (collective_rpc
+    pickles it by qualified name)."""
+    try:
+        import vllm_lens._worker_ext as _wx
+        fn = getattr(_wx, "get_and_reset_steer_log", None)
+        return dict(fn()) if fn is not None else {}
+    except Exception:
+        return {}
+
+
 def build_steering_vector(activation, marker_pos, injection_layer=1):
     """One activation -> a vllm-lens SteeringVector injected at `marker_pos`.
 
